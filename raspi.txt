@@ -1,0 +1,230 @@
+Ah yes 😄 — understood now. You want to **run the QR detection code directly on the Raspberry Pi 5 with the Raspberry Pi AI Camera connected to it**.
+
+So we don't need any streaming/network setup.
+
+The architecture is simply:
+
+```text
+Raspberry Pi AI Camera
+        ↓
+     Picamera2
+        ↓
+    OpenCV frame
+        ↓
+  WeChatQRCode
+        ↓
+ QR detection + decoding
+```
+
+### Use this code on the Raspberry Pi
+
+```python
+
+
+
+----------------------------------------------------------------------------------------------
+import cv2
+import numpy as np
+from picamera2 import Picamera2
+import time
+
+# ==========================================
+# INITIALIZE WECHAT QR CODE DETECTOR
+# ==========================================
+
+detector = cv2.wechat_qrcode_WeChatQRCode(
+    "models/detect.prototxt",
+    "models/detect.caffemodel",
+    "models/sr.prototxt",
+    "models/sr.caffemodel"
+)
+
+# ==========================================
+# INITIALIZE RASPBERRY PI AI CAMERA
+# ==========================================
+
+picam2 = Picamera2()
+
+camera_config = picam2.create_preview_configuration(
+    main={
+        "size": (1280, 720),
+        "format": "RGB888"
+    }
+)
+
+picam2.configure(camera_config)
+picam2.start()
+
+# Give camera time to start
+time.sleep(2)
+
+print("Raspberry Pi AI Camera started.")
+print("Point the camera at a QR code.")
+print("Press Q to quit.")
+
+# ==========================================
+# MAIN LOOP
+# ==========================================
+
+while True:
+
+    # Capture frame from AI Camera
+    frame = picam2.capture_array()
+
+    # Picamera2 gives RGB → OpenCV uses BGR
+    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+    # ======================================
+    # QR DETECTION + DECODING
+    # ======================================
+
+    texts, points = detector.detectAndDecode(frame)
+
+    if texts:
+
+        print(f"QR codes detected: {len(texts)}")
+
+        # Process every detected QR
+        for i, text in enumerate(texts):
+
+            print(f"QR {i + 1}: {text}")
+
+            if points is not None and i < len(points):
+
+                corners = points[i].astype(int)
+
+                # Draw QR boundary
+                for j in range(4):
+
+                    cv2.line(
+                        frame,
+                        tuple(corners[j]),
+                        tuple(corners[(j + 1) % 4]),
+                        (0, 255, 0),
+                        3
+                    )
+
+                # Calculate centre
+                center_x = int(np.mean(corners[:, 0]))
+                center_y = int(np.mean(corners[:, 1]))
+
+                # Draw centre point
+                cv2.circle(
+                    frame,
+                    (center_x, center_y),
+                    6,
+                    (0, 0, 255),
+                    -1
+                )
+
+                # Display decoded information
+                cv2.putText(
+                    frame,
+                    f"QR {i + 1}: {text}",
+                    (10, 30 + i * 35),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 0),
+                    2
+                )
+
+    else:
+
+        cv2.putText(
+            frame,
+            "No QR detected",
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 0, 255),
+            2
+        )
+
+    # ======================================
+    # DISPLAY CAMERA FEED
+    # ======================================
+
+    cv2.imshow("Raspberry Pi AI Camera - QR Detection", frame)
+
+    # Press Q to exit
+    if cv2.waitKey(1) & 0xFF == ord("q"):
+        break
+
+
+# ==========================================
+# CLEANUP
+# ==========================================
+
+picam2.stop()
+cv2.destroyAllWindows()
+
+print("Camera stopped.")
+```
+
+-------------------------------------------------------------------------------------------------
+
+### Your Pi folder should look like
+
+```text
+Squadrone/
+│
+├── qr_camera.py
+│
+└── models/
+    ├── detect.prototxt
+    ├── detect.caffemodel
+    ├── sr.prototxt
+    └── sr.caffemodel
+```
+
+### Before running it on the Pi
+
+First verify the **AI Camera itself**:
+
+```bash
+rpicam-hello
+```
+
+If that works, then verify Picamera2:
+
+```bash
+python3 -c "from picamera2 import Picamera2; print('Picamera2 OK')"
+```
+
+And verify WeChatQRCode:
+
+```bash
+python3 -c "import cv2; print(cv2.__version__); print(hasattr(cv2, 'wechat_qrcode_WeChatQRCode'))"
+```
+
+We need the last one to return:
+
+```text
+True
+```
+
+### One important difference from your laptop
+
+On your laptop we used:
+
+```python
+cv2.VideoCapture(0)
+```
+
+because the laptop webcam is a normal OpenCV video device.
+
+For the **Raspberry Pi AI Camera**, we should use:
+
+```python
+from picamera2 import Picamera2
+```
+
+and:
+
+```python
+frame = picam2.capture_array()
+```
+
+That's the correct approach for the Pi camera.
+
+And I've already changed the code to handle **multiple QR codes**, rather than only `texts[0]`. So this is a better starting point for the actual AeroTHON requirement.
