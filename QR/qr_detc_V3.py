@@ -796,6 +796,14 @@ def start_camera():
     )
 
     camera.configure(config)
+    from libcamera import controls
+
+    camera.start()
+    camera.set_controls({
+        "AfMode": controls.AfModeEnum.Continuous,
+        "AfSpeed": controls.AfSpeedEnum.Fast,
+    })
+    
     camera.start()
 
     # Allow exposure and autofocus to settle.
