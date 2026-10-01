@@ -93,6 +93,14 @@ SENSOR_FULL_WIDTH_PX = 4656       # native IMX519 active width
 PRINT_ON_CONFIRMATION = True
 FPS_LOG_INTERVAL = 2.0
 
+# Camera selection. This Pi has multiple cameras attached (e.g. an imx500
+# AI camera alongside the imx519). Picamera2() with no argument opens
+# camera index 0, which may NOT be the IMX519 and will fail on AfMode.
+# Set this to the correct index, found by running on the Pi:
+#   python -c "from picamera2 import Picamera2; print(Picamera2.global_camera_info())"
+# and looking for the entry with Model containing "imx519".
+CAMERA_INDEX = None   # None = auto-detect by model name; set an int to force it
+
 # WeChat model files
 MODEL_DIR = BASE_DIR / "models"
 WECHAT_DETECT_PROTOTXT = str(MODEL_DIR / "detect.prototxt")
@@ -583,12 +591,39 @@ def apply_focus_mode(camera, mode):
     return "continuous"
 
 
+def resolve_camera_index():
+    """
+    Pick the IMX519's camera index. Multiple cameras may be attached
+    (e.g. an imx500 AI camera alongside the imx519), and Picamera2()
+    with no argument opens index 0, which may be the wrong sensor.
+    """
+
+    if CAMERA_INDEX is not None:
+        return CAMERA_INDEX
+
+    cameras = Picamera2.global_camera_info()
+    logging.info("Cameras detected: %s",
+                 [(c.get("Num"), c.get("Model")) for c in cameras])
+
+    for cam_info in cameras:
+        if "imx519" in str(cam_info.get("Model", "")).lower():
+            logging.info("Selected imx519 at index %s", cam_info.get("Num"))
+            return cam_info.get("Num", 0)
+
+    logging.warning(
+        "No camera with 'imx519' in its model name was found; "
+        "defaulting to index 0. Set CAMERA_INDEX manually if this is wrong."
+    )
+    return 0
+
+
 def start_camera():
     """Initialize the Arducam IMX519 through Picamera2."""
 
     global sensor_crop_width_px
 
-    camera = Picamera2()
+    camera_index = resolve_camera_index()
+    camera = Picamera2(camera_num=camera_index)
 
     config = camera.create_video_configuration(
         main={"size": (CAMERA_WIDTH, CAMERA_HEIGHT),

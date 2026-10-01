@@ -4,6 +4,9 @@ SQUADRONE - ONBOARD QR DETECTION (mission ready)
 Hardware:
     Raspberry Pi 5
     Arducam IMX519 Autofocus (SKU B0371)
+    NOTE: this Pi also has a second camera (e.g. imx500) attached.
+          Picamera2() with no index can open the WRONG camera, which
+          then fails on AfMode/AfSpeed. See resolve_camera_index().
 
 Primary detector : OpenCV WeChatQRCode
 Fallback         : pyzbar
@@ -13,6 +16,11 @@ Changes from perception prototype:
     - get_alignment_offset() returns (north_m, east_m) for velocity control
     - altitude can be updated live via set_altitude()
     - module can be imported by FSM or run standalone
+    - Auto-detects and opens the IMX519 specifically (fixes
+      "RuntimeError: Control AfMode is not advertised by libcamera")
+    - update_tracks() now uses the actual captured frame height instead
+      of the CAMERA_HEIGHT constant, so it can't silently drift if the
+      camera returns a different resolution than requested
 """
 
 import cv2
@@ -38,6 +46,13 @@ BASE_DIR = Path(__file__).resolve().parent
 CAMERA_WIDTH    = 1920
 CAMERA_HEIGHT   = 1080
 CAMERA_FORMAT   = "RGB888"
+
+# Camera selection. This Pi has multiple cameras attached (e.g. an imx500
+# AI camera alongside the imx519). Picamera2() with no argument opens
+# camera index 0, which may NOT be the IMX519 and will fail on AfMode.
+# To check manually, run on the Pi:
+#   python -c "from picamera2 import Picamera2; print(Picamera2.global_camera_info())"
+CAMERA_INDEX = None   # None = auto-detect by model name; set an int to force it
 
 LENS_POSITION   = None
 EXPOSURE_US     = None
@@ -344,7 +359,7 @@ def find_track(detection):
     return None
 
 
-def update_tracks(detections, image_width_px):
+def update_tracks(detections, image_width_px, image_height_px):
     """
     Update tracking state and write FSM-facing globals
     (_confirmed_target, _last_north_m, _last_east_m).
@@ -404,8 +419,8 @@ def update_tracks(detections, image_width_px):
 
             # Always update offset for the confirmed target
             if t.text == _confirmed_target:
-                img_cx  = image_width_px // 2
-                img_cy  = CAMERA_HEIGHT  // 2
+                img_cx  = image_width_px  // 2
+                img_cy  = image_height_px // 2
                 off_x   = t.cx - img_cx
                 off_y   = t.cy - img_cy
                 n, e    = pixel_to_ned_offset(
@@ -504,8 +519,34 @@ def draw_overlay(display, detections, blur_score, sharp, fps,
 
 
 # ============================================================
-# CAMERA INITIALIZATION  (unchanged)
+# CAMERA INITIALIZATION
 # ============================================================
+
+def resolve_camera_index():
+    """
+    Pick the IMX519's camera index. Multiple cameras may be attached
+    (e.g. an imx500 AI camera alongside the imx519), and Picamera2()
+    with no argument opens index 0, which may be the wrong sensor.
+    """
+
+    if CAMERA_INDEX is not None:
+        return CAMERA_INDEX
+
+    cameras = Picamera2.global_camera_info()
+    logging.info("Cameras detected: %s",
+                 [(c.get("Num"), c.get("Model")) for c in cameras])
+
+    for cam_info in cameras:
+        if "imx519" in str(cam_info.get("Model", "")).lower():
+            logging.info("Selected imx519 at index %s", cam_info.get("Num"))
+            return cam_info.get("Num", 0)
+
+    logging.warning(
+        "No camera with 'imx519' in its model name was found; "
+        "defaulting to index 0. Set CAMERA_INDEX manually if this is wrong."
+    )
+    return 0
+
 
 def apply_focus_mode(camera, mode):
     if isinstance(mode, (int, float)):
@@ -530,7 +571,10 @@ def apply_focus_mode(camera, mode):
 
 def start_camera():
     global sensor_crop_width_px
-    camera = Picamera2()
+
+    camera_index = resolve_camera_index()
+    camera = Picamera2(camera_num=camera_index)
+
     config = camera.create_video_configuration(
         main={"size": (CAMERA_WIDTH, CAMERA_HEIGHT),
               "format": CAMERA_FORMAT},
@@ -601,8 +645,8 @@ def main():
                     det.corners[:, 0] *= sx
                     det.corners[:, 1] *= sy
 
-            # ── Pass image_width so tracking can update FSM globals ──
-            update_tracks(detections, original_w)
+            # ── Pass image size so tracking can update FSM globals ──
+            update_tracks(detections, original_w, original_h)
 
             processing_ms = (time.perf_counter() - loop_start) * 1000.0
 
