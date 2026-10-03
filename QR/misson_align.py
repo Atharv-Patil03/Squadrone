@@ -134,16 +134,12 @@ wechat = cv2.wechat_qrcode_WeChatQRCode(
 )
 
 def preprocess(frame):
+    # WeChatQRCode CNN works better on natural colour frames
+    # Only resize if needed
     if frame.shape[1] > 1920:
         scale = 1920 / frame.shape[1]
         frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    gray = clahe.apply(gray)
-    kernel = np.array([[0,-1,0],[-1,5,-1],[0,-1,0]])
-    gray = cv2.filter2D(gray, -1, kernel)
-    gray = cv2.GaussianBlur(gray, (3,3), 0)
-    return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    return frame
 
 def is_sharp(frame, threshold=100):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -167,6 +163,9 @@ def detect_qr(frame):
     return None, None, None, None
 
 # ─── GSD CALCULATION ──────────────────────────────────────────────
+# NOTE: This uses fixed sensor constants.
+# Final FSM uses qr_module.get_alignment_offset() which
+# reads actual ScalerCrop from camera metadata — more accurate.
 def pixel_to_ned(offset_x_px, offset_y_px, altitude_m):
     gsd = (SENSOR_WIDTH_MM / 1000 * altitude_m) / \
           (FOCAL_LENGTH_MM  / 1000 * IMAGE_WIDTH_PX)
@@ -210,7 +209,7 @@ def state_qr_scan(mav, cam):
 
     while True:
         frame = cam.capture_array()
-        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        
 
         if not is_sharp(frame):
             decode_history.clear()
@@ -262,7 +261,7 @@ def state_alignment(mav, cam, delivery_target):
 
     while True:
         frame = cam.capture_array()
-        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        
 
         if not is_sharp(frame):
             aligned_count = 0

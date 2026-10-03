@@ -436,6 +436,62 @@ def update_tracks(detections, image_width_px, image_height_px):
                 if t.misses > MAX_MISSED_FRAMES]:
         del tracks[tid]
 
+def process_frame(frame):
+    """
+    Process one camera frame.
+
+    Called by the FSM once per captured frame.
+    Runs QR detection, updates tracking, and updates
+    the FSM-facing globals.
+
+    The FSM can then read:
+        get_confirmed_target()
+        get_alignment_offset()
+    """
+
+    original_h, original_w = frame.shape[:2]
+
+    # --------------------------------------------------------
+    # Blur check
+    # --------------------------------------------------------
+    if BLUR_GATE_ENABLED:
+        score = sharpness_score(frame)
+
+        if score < BLUR_THRESHOLD:
+            return
+
+    # --------------------------------------------------------
+    # Preprocess
+    # --------------------------------------------------------
+    processed, sx, sy = preprocess_frame(frame)
+
+    # --------------------------------------------------------
+    # QR detection
+    # --------------------------------------------------------
+    detections = detect_qrs(processed)
+
+    # --------------------------------------------------------
+    # Convert detection coordinates back to the
+    # original camera-frame resolution
+    # --------------------------------------------------------
+    for det in detections:
+        det.cx *= sx
+        det.cy *= sy
+
+        det.corners[:, 0] *= sx
+        det.corners[:, 1] *= sy
+
+    # --------------------------------------------------------
+    # Update tracking + FSM state
+    # --------------------------------------------------------
+    update_tracks(
+        detections,
+        original_w,
+        original_h
+    )
+
+    return detections
+
 
 # ============================================================
 # DISPLAY  (unchanged from prototype)
