@@ -38,7 +38,7 @@ if msg:
 else:
     print("No ARM acknowledgement received")
 
-time.sleep(3)
+time.sleep(7)
 
 # Check armed status
 msg = connection.recv_match(
