@@ -4,9 +4,9 @@ import time
 BUS_NUMBER = 1
 
 # Defined Addresses
-ADDR_LEFT = 0x11
-ADDR_FRONT = 0x12
-ADDR_RIGHT = 0x14
+ADDR_LEFT = 0x15
+ADDR_FRONT = 0x14
+ADDR_RIGHT = 0x11
 
 def read_tfmini_s(bus, address):
     OBTAIN_DATA_CMD = [0x5A, 0x05, 0x00, 0x01, 0x60]
@@ -29,9 +29,9 @@ if __name__ == "__main__":
     print("Starting 3x TFmini-S LiDAR output...")
     with SMBus(BUS_NUMBER) as bus:
         while True:
-            left_dist = read_tfmini_s(bus, ADDR_LEFT)
-            front_dist = read_tfmini_s(bus, ADDR_FRONT)
-            right_dist = read_tfmini_s(bus, ADDR_RIGHT)
+            left_dist = read_tfmini_s(bus, ADDR_LEFT) + 4
+            front_dist = read_tfmini_s(bus, ADDR_FRONT) + 4
+            right_dist = read_tfmini_s(bus, ADDR_RIGHT)  + 4
            
             l_str = f"{left_dist:4d} cm" if left_dist is not None else " Error "
             f_str = f"{front_dist:4d} cm" if front_dist is not None else " Error "
