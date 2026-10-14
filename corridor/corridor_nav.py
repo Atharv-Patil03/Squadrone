@@ -18,6 +18,7 @@ States handled:
 
 from smbus2 import SMBus, i2c_msg
 from pymavlink import mavutil
+import cv2
 import time
 import logging
 
@@ -122,7 +123,7 @@ def set_mode(mav, mode_name):
         msg = mav.recv_match(
             type='HEARTBEAT', blocking=True, timeout=1
         )
-        if msg and mavutil.mode_string_v10(msg) == mode_name:
+        if msg and msg.custom_mode == mode_id:
             logging.info(f"Mode set: {mode_name}")
             return True
     logging.warning(f"Mode change to {mode_name} not confirmed")
@@ -149,11 +150,9 @@ def descend_to_altitude(mav, target_alt_m, tolerance=0.3):
 
     start = time.time()
     while time.time() - start < 15:
-        msg = mav.recv_match(
-            type='VFR_HUD', blocking=True, timeout=1
-        )
+        msg = mav.recv_match(type='GLOBAL_POSITION_INT', blocking=True, timeout=1)
         if msg:
-            current = msg.alt
+            current = msg.relative_alt / 1000.0
             logging.info(f"  Alt: {current:.2f}m", )
             if abs(current - target_alt_m) < tolerance:
                 logging.info(f"Reached {current:.2f}m")
@@ -235,7 +234,7 @@ def state_corridor_entry(mav, cam_ai, detect_banner_fn,
     while True:
         frame = cam_ai.capture_array()
 
-        import cv2
+        
         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
         detected, cx, cy, area, yaw_offset = detect_banner_fn(frame)

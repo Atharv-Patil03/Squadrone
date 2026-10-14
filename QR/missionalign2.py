@@ -141,6 +141,11 @@ def arm_and_takeoff(mav, altitude_m):
     set_mode(mav, 'GUIDED')
     time.sleep(1)
 
+    print("\nChecks: props secure? area clear? RC on?")
+    if input("Type YES to arm: ").strip().upper() != "YES":
+        print("Cancelled")
+        return False
+
     mav.mav.command_long_send(
         mav.target_system, mav.target_component,
         mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
@@ -172,7 +177,7 @@ def land_and_disarm(mav):
     while time.time() - start < 40:
         alt = get_altitude(mav)
         print(f"  Altitude: {alt:.2f}m", end='\r')
-        if alt < 0.3:
+        if alt < 0.5:
             print("\nLanded")
             break
     time.sleep(2)
@@ -353,6 +358,9 @@ def state_qr_scan(mav, cam):
 
 # ─── S6: TARGET ALIGNMENT ─────────────────────────────────────────
 def state_alignment(mav, cam, delivery_target):
+    if not delivery_target:
+        print("ERROR: no delivery target set")
+        return False
     print("\n── S6: Target Alignment ──")
     set_mode(mav, 'GUIDED')
 
