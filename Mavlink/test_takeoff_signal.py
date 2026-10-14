@@ -50,7 +50,7 @@ else:
         print("\nERROR: GUIDED mode is not available.")
     else:
 
-        guided_mode = mode_mapping['STABILIZE']
+        guided_mode = mode_mapping['LOITER']
 
         mav.mav.set_mode_send(
             mav.target_system,

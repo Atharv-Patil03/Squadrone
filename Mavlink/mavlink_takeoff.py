@@ -1,3 +1,8 @@
+# python /home/squadrone/Downloads/Squadrone/Squadrone/Mavlink/mavlink_connect.py
+# python /home/squadrone/Downloads/Squadrone/Squadrone/Mavlink/mavlink_arm.py
+# python /home/squadrone/Downloads/Squadrone/Squadrone/Mavlink/mavlink_takeoff.py
+
+
 from pymavlink import mavutil
 import time
 

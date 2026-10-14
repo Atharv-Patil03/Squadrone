@@ -1,7 +1,6 @@
 # python ~/Downloads/Squadrone/Squadrone/QR/qr_flight_logger.py
 
 
-
 """
 SQUADRONE - ONBOARD QR DETECTION (mission ready)
 
