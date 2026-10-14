@@ -16,11 +16,23 @@ Changes from perception prototype:
     - get_alignment_offset() returns (north_m, east_m) for velocity control
     - altitude can be updated live via set_altitude()
     - module can be imported by FSM or run standalone
-    - Auto-detects and opens the IMX519 specifically (fixes
-      "RuntimeError: Control AfMode is not advertised by libcamera")
-    - update_tracks() now uses the actual captured frame height instead
-      of the CAMERA_HEIGHT constant, so it can't silently drift if the
-      camera returns a different resolution than requested
+    - Auto-detects and opens the IMX519 specifically
+    - update_tracks() uses the actual captured frame height
+
+NEW - dual matching (text / image / both):
+    - store_reference()  : saves start-QR text + image crop (auto in S2)
+    - is_target_qr()     : text match, image match, or both
+    - start_delivery_search() : switch to delivery phase; offsets are then
+                                computed ONLY for the QR matching the reference
+    - is_target_visible(): FSM check that the target is in view this frame
+    - stale offsets are zeroed when the target is not visible
+
+FSM USAGE
+    S2 (start QR):   process_frame(frame)  -> poll get_confirmed_target()
+                     reference is stored automatically on confirmation
+    S5 (delivery):   start_delivery_search()   (keeps the reference)
+                     process_frame(frame) -> is_target_visible(),
+                                             get_alignment_offset()
 """
 
 import cv2
@@ -47,12 +59,8 @@ CAMERA_WIDTH    = 1920
 CAMERA_HEIGHT   = 1080
 CAMERA_FORMAT   = "RGB888"
 
-# Camera selection. This Pi has multiple cameras attached (e.g. an imx500
-# AI camera alongside the imx519). Picamera2() with no argument opens
-# camera index 0, which may NOT be the IMX519 and will fail on AfMode.
-# To check manually, run on the Pi:
-#   python -c "from picamera2 import Picamera2; print(Picamera2.global_camera_info())"
-CAMERA_INDEX = None   # None = auto-detect by model name; set an int to force it
+# None = auto-detect IMX519 by model name; set an int to force it
+CAMERA_INDEX = None
 
 LENS_POSITION   = None
 EXPOSURE_US     = None
@@ -71,7 +79,7 @@ TRACK_MATCH_DISTANCE  = 100
 SHOW_PREVIEW   = True
 DISPLAY_WIDTH  = 1280
 
-# GSD — altitude updated live via set_altitude()
+# GSD - altitude updated live via set_altitude()
 ALTITUDE_M          = 5.0
 FOCAL_LENGTH_MM     = 4.28
 PIXEL_SIZE_UM       = 1.22
@@ -85,6 +93,24 @@ WECHAT_DETECT_PROTOTXT = str(MODEL_DIR / "detect.prototxt")
 WECHAT_DETECT_MODEL    = str(MODEL_DIR / "detect.caffemodel")
 WECHAT_SR_PROTOTXT     = str(MODEL_DIR / "sr.prototxt")
 WECHAT_SR_MODEL        = str(MODEL_DIR / "sr.caffemodel")
+
+# ─── DETECTION MODE ───────────────────────────────────────────────
+# Set this on the day, based on what the organisers tell you.
+# "text"  - compare decoded text only (QR has readable content)
+# "image" - compare QR visual pattern only (content unknown/unreadable)
+# "both"  - text decides when BOTH QRs decode to non-empty text,
+#           otherwise falls back to image matching
+DETECTION_MODE = "both"
+
+TEXT_MATCH_ENABLED  = True
+IMAGE_MATCH_ENABLED = True
+
+# Image similarity (normalised correlation, -1..1, higher = more alike).
+# TUNE THIS ON THE BENCH: print scores for same-QR vs different-QR and
+# pick a value between the two clusters.
+IMAGE_MATCH_THRESHOLD = 0.60
+CROP_SIZE             = 200
+SAVE_REFERENCE_CROP   = True
 
 
 # ============================================================
@@ -141,11 +167,17 @@ next_track_id = 1
 sensor_crop_width_px = SENSOR_FULL_WIDTH_PX
 
 # ── FSM-FACING STATE ──────────────────────────────────────────────
-# These are read by get_confirmed_target() and get_alignment_offset()
-_confirmed_target   = None      # str  — set when first QR confirmed
-_last_north_m       = 0.0       # float — NED offset to confirmed QR
+_confirmed_target   = None      # str  - set when first QR confirmed (S2)
+_last_north_m       = 0.0       # float - NED offset to target QR
 _last_east_m        = 0.0
 _live_altitude_m    = ALTITUDE_M
+
+# ── REFERENCE + DELIVERY STATE ────────────────────────────────────
+reference_text  = None          # decoded text of start QR ("" if none)
+reference_crop  = None          # 200x200 equalised grayscale of start QR
+_delivery_mode  = False         # True after start_delivery_search()
+_target_visible = False         # delivery target matched this frame
+_last_match_info = ""           # "method: info" for overlay/debug
 
 
 def set_altitude(alt_m: float):
@@ -156,32 +188,70 @@ def set_altitude(alt_m: float):
 
 def get_confirmed_target() -> str | None:
     """
-    Returns the confirmed delivery target string once consensus is reached.
+    Returns the confirmed start-QR string once consensus is reached.
     Returns None if not yet confirmed.
-    FSM polls this every frame during S2.
+    NOTE: in "image"/"both" mode this can be "" (empty string) for a QR
+    with no readable text - check `is None`, not truthiness.
     """
     return _confirmed_target
 
 
 def get_alignment_offset() -> tuple[float, float]:
     """
-    Returns (north_m, east_m) offset from image centre to confirmed QR.
-    FSM uses this during S6 to generate velocity commands.
-    Returns (0.0, 0.0) if confirmed QR is not visible.
+    Returns (north_m, east_m) offset from image centre to the target QR.
+    Returns (0.0, 0.0) if the target QR is not visible this frame.
     """
     return _last_north_m, _last_east_m
 
 
-def reset_detection():
-    """Call between missions or on FSM state reset."""
-    global _confirmed_target, _last_north_m, _last_east_m
-    global tracks, next_track_id
+def is_target_visible() -> bool:
+    """
+    Delivery phase: True if the QR matching the reference was seen in the
+    most recent processed frame.
+    """
+    return _target_visible
+
+
+def _zero_offsets():
+    global _last_north_m, _last_east_m
+    _last_north_m = 0.0
+    _last_east_m  = 0.0
+
+
+def reset_detection(keep_reference: bool = False):
+    """
+    Call between missions or on FSM state reset.
+    keep_reference=True keeps the stored start-QR reference (text + image).
+    """
+    global _confirmed_target, tracks, next_track_id
+    global _delivery_mode, _target_visible, _last_match_info
     _confirmed_target = None
-    _last_north_m     = 0.0
-    _last_east_m      = 0.0
+    _zero_offsets()
     tracks            = {}
     next_track_id     = 1
-    logging.info("Detection state reset")
+    _delivery_mode    = False
+    _target_visible   = False
+    _last_match_info  = ""
+    if not keep_reference:
+        clear_reference()
+    logging.info("Detection state reset (keep_reference=%s)", keep_reference)
+
+
+def start_delivery_search():
+    """
+    Call when the FSM moves to the delivery phase (S5).
+    Keeps the reference, clears tracks/offsets, and from now on offsets are
+    computed only for the QR that matches the reference.
+    """
+    global _delivery_mode, _target_visible, tracks, next_track_id
+    if not reference_ready():
+        logging.warning("start_delivery_search() with NO reference stored")
+    tracks          = {}
+    next_track_id   = 1
+    _delivery_mode  = True
+    _target_visible = False
+    _zero_offsets()
+    logging.info("Delivery search started (mode=%s)", DETECTION_MODE)
 
 
 # ============================================================
@@ -291,6 +361,127 @@ def calculate_center(corners):
 
 
 # ============================================================
+# REFERENCE STORAGE + MATCHING  (text / image / both)
+# ============================================================
+
+def extract_qr_crop(frame, corners):
+    """
+    Perspective-correct crop of the QR region.
+    `frame` must be in the SAME coordinate system as `corners`
+    (i.e. the original camera frame, since corners are scaled back).
+    Returns CROP_SIZE x CROP_SIZE equalised grayscale, or None.
+    """
+    try:
+        corners = np.asarray(corners, dtype=np.float32).reshape(-1, 2)
+        if len(corners) < 4:
+            return None
+
+        dst = np.array([[0, 0],
+                        [CROP_SIZE, 0],
+                        [CROP_SIZE, CROP_SIZE],
+                        [0, CROP_SIZE]], dtype=np.float32)
+
+        M    = cv2.getPerspectiveTransform(corners[:4], dst)
+        crop = cv2.warpPerspective(frame, M, (CROP_SIZE, CROP_SIZE))
+        if crop.ndim == 3:
+            crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        return cv2.equalizeHist(crop)
+
+    except Exception as exc:
+        logging.warning("Crop error: %s", exc)
+        return None
+
+
+def image_similarity(ref_gray, cand_gray):
+    """
+    Normalised correlation between two same-size crops, taking the best of
+    4 rotations (corner order from the detector can rotate the crop).
+    Returns a float in about -1..1; higher = more similar.
+    """
+    ref  = cv2.GaussianBlur(ref_gray, (5, 5), 0)
+    cand = cv2.GaussianBlur(cand_gray, (5, 5), 0)
+    best = -1.0
+    for _ in range(4):
+        score = float(cv2.matchTemplate(
+            cand, ref, cv2.TM_CCOEFF_NORMED)[0][0])
+        best = max(best, score)
+        cand = cv2.rotate(cand, cv2.ROTATE_90_CLOCKWISE)
+    return best
+
+
+def store_reference(frame, corners, decoded_text):
+    """
+    Store the start QR as the reference (text + image crop).
+    Called automatically from process_frame() when the start QR confirms,
+    or call it manually.
+    """
+    global reference_text, reference_crop
+
+    reference_text = decoded_text if decoded_text else ""
+    logging.info("Reference text stored: '%s'", reference_text)
+
+    crop = extract_qr_crop(frame, corners)
+    if crop is not None:
+        reference_crop = crop
+        if SAVE_REFERENCE_CROP:
+            cv2.imwrite(str(BASE_DIR / "reference_qr_crop.png"), crop)
+        logging.info("Reference QR image stored")
+    else:
+        reference_crop = None
+        logging.warning("Could not extract QR crop for image matching")
+
+
+def clear_reference():
+    global reference_text, reference_crop
+    reference_text = None
+    reference_crop = None
+
+
+def reference_ready():
+    """True if at least one reference method is available."""
+    return reference_text is not None or reference_crop is not None
+
+
+def is_target_qr(frame, corners, decoded_text):
+    """
+    Returns (is_match, method, info).
+
+    "text"  : text only. Needs non-empty reference text.
+    "image" : image similarity only.
+    "both"  : if reference AND candidate both have non-empty text, text
+              decides (a text mismatch is a rejection - no image fallback).
+              Otherwise image similarity decides.
+    """
+    if not reference_ready():
+        return False, "none", "no reference stored"
+
+    ref_text  = (reference_text or "").strip()
+    cand_text = (decoded_text or "").strip()
+
+    # ── Text matching ──────────────────────────────────────────────
+    if TEXT_MATCH_ENABLED and DETECTION_MODE in ("text", "both"):
+        if DETECTION_MODE == "text":
+            if not ref_text:
+                return False, "text", "reference has no text"
+            return cand_text == ref_text, "text", cand_text
+        if ref_text and cand_text:
+            return cand_text == ref_text, "text", cand_text
+
+    # ── Image matching ─────────────────────────────────────────────
+    if (IMAGE_MATCH_ENABLED and DETECTION_MODE in ("image", "both")
+            and reference_crop is not None):
+        crop = extract_qr_crop(frame, corners)
+        if crop is not None:
+            score = image_similarity(reference_crop, crop)
+            match = score >= IMAGE_MATCH_THRESHOLD
+            logging.debug("Image similarity %.3f (%s)", score,
+                          "MATCH" if match else "no match")
+            return match, "image", f"sim={score:.2f}"
+
+    return False, "none", "no match method succeeded"
+
+
+# ============================================================
 # DETECTORS
 # ============================================================
 
@@ -305,14 +496,17 @@ def detect_with_wechat(frame):
             return detections
         points = np.asarray(points)
         for i, text in enumerate(texts):
-            if not text or i >= len(points):
+            # Empty text is only usable when image matching is allowed
+            if not text and DETECTION_MODE == "text":
+                continue
+            if i >= len(points):
                 continue
             corners = normalize_corners(points[i])
             if corners is None:
                 continue
             cx, cy = calculate_center(corners)
             detections.append(
-                Detection(text=text, cx=cx, cy=cy,
+                Detection(text=text or "", cx=cx, cy=cy,
                           corners=corners, method="WeChat"))
     except cv2.error as exc:
         logging.warning("WeChat error: %s", exc)
@@ -359,10 +553,14 @@ def find_track(detection):
     return None
 
 
-def update_tracks(detections, image_width_px, image_height_px):
+def update_tracks(detections, image_width_px, image_height_px,
+                  update_fsm_state=True):
     """
-    Update tracking state and write FSM-facing globals
-    (_confirmed_target, _last_north_m, _last_east_m).
+    Update tracking state. When update_fsm_state is True (start-QR phase)
+    also writes _confirmed_target and the offsets; the offsets are zeroed
+    on frames where the confirmed target is not seen.
+    In the delivery phase update_fsm_state is False and offsets come from
+    _update_delivery_offset() instead.
     """
     global next_track_id, _confirmed_target
     global _last_north_m, _last_east_m
@@ -370,7 +568,8 @@ def update_tracks(detections, image_width_px, image_height_px):
     for track in tracks.values():
         track.misses += 1
 
-    unmatched = set(tracks.keys())
+    unmatched   = set(tracks.keys())
+    seen_target = False
 
     for det in detections:
         best_id   = None
@@ -408,28 +607,26 @@ def update_tracks(detections, image_width_px, image_height_px):
                 and not t.confirmed):
             t.confirmed = True
             if PRINT_ON_CONFIRMATION and not t.printed:
-                print(f"\nQR CONFIRMED | ID={t.track_id} | Text={t.text}")
+                print(f"\nQR CONFIRMED | ID={t.track_id} | Text={t.text!r}")
                 t.printed = True
 
-        # ── Update FSM globals ────────────────────────────────────
-        if t.confirmed:
-            # First confirmation sets the target
+        # ── Update FSM globals (start-QR phase only) ──────────────
+        if update_fsm_state and t.confirmed:
             if _confirmed_target is None:
                 _confirmed_target = t.text
 
-            # Always update offset for the confirmed target
             if t.text == _confirmed_target:
-                img_cx  = image_width_px  // 2
-                img_cy  = image_height_px // 2
-                off_x   = t.cx - img_cx
-                off_y   = t.cy - img_cy
-                n, e    = pixel_to_ned_offset(
-                    off_x, off_y,
-                    _live_altitude_m,
-                    image_width_px
-                )
+                seen_target = True
+                off_x = t.cx - image_width_px  // 2
+                off_y = t.cy - image_height_px // 2
+                n, e  = pixel_to_ned_offset(
+                    off_x, off_y, _live_altitude_m, image_width_px)
                 _last_north_m = n
                 _last_east_m  = e
+
+    # Target not visible this frame -> don't leave stale offsets
+    if update_fsm_state and _confirmed_target is not None and not seen_target:
+        _zero_offsets()
 
     # Remove stale tracks
     for tid in [tid for tid, t in tracks.items()
@@ -437,8 +634,78 @@ def update_tracks(detections, image_width_px, image_height_px):
         del tracks[tid]
 
 
+def _update_delivery_offset(frame, detections, image_w, image_h):
+    """
+    Delivery phase: find the detection that matches the reference and
+    compute its offset. Zero everything if no match this frame.
+    """
+    global _last_north_m, _last_east_m, _target_visible, _last_match_info
+
+    for det in detections:
+        ok, method, info = is_target_qr(frame, det.corners, det.text)
+        if ok:
+            off_x = det.cx - image_w // 2
+            off_y = det.cy - image_h // 2
+            n, e  = pixel_to_ned_offset(
+                off_x, off_y, _live_altitude_m, image_w)
+            _last_north_m    = n
+            _last_east_m     = e
+            _target_visible  = True
+            _last_match_info = f"{method}: {info}"
+            return
+
+    _zero_offsets()
+    _target_visible  = False
+    _last_match_info = "no match"
+
+
+def process_frame(frame):
+    """
+    Process one camera frame (call once per captured frame from the FSM).
+
+    Start-QR phase    : confirms the start QR, stores the reference
+                        automatically, updates get_alignment_offset().
+    Delivery phase    : (after start_delivery_search()) matches detections
+                        against the reference; read is_target_visible()
+                        and get_alignment_offset().
+
+    Returns the list of detections (None if the frame was skipped by the
+    blur gate).
+    """
+    original_h, original_w = frame.shape[:2]
+
+    if BLUR_GATE_ENABLED:
+        if sharpness_score(frame) < BLUR_THRESHOLD:
+            return None
+
+    processed, sx, sy = preprocess_frame(frame)
+    detections        = detect_qrs(processed)
+
+    # Back to original camera-frame resolution
+    for det in detections:
+        det.cx *= sx
+        det.cy *= sy
+        det.corners[:, 0] *= sx
+        det.corners[:, 1] *= sy
+
+    update_tracks(detections, original_w, original_h,
+                  update_fsm_state=not _delivery_mode)
+
+    if _delivery_mode:
+        # corners are in original-frame coords -> pass the ORIGINAL frame
+        _update_delivery_offset(frame, detections, original_w, original_h)
+
+    elif _confirmed_target is not None and not reference_ready():
+        for det in detections:
+            if det.text == _confirmed_target:
+                store_reference(frame, det.corners, det.text)
+                break
+
+    return detections
+
+
 # ============================================================
-# DISPLAY  (unchanged from prototype)
+# DISPLAY
 # ============================================================
 
 def put_text(img, text, org, colour=(255,255,255), scale=0.6, thickness=2):
@@ -467,13 +734,24 @@ def draw_overlay(display, detections, blur_score, sharp, fps,
              (10, 60),
              (255,255,255) if sharp else (0,165,255))
     put_text(display,
-             f"Focus: {focus_mode}  Alt: {_live_altitude_m:.1f}m",
+             f"Focus: {focus_mode}  Alt: {_live_altitude_m:.1f}m  "
+             f"Mode: {DETECTION_MODE}",
              (10, 90))
 
-    if _confirmed_target:
+    if _delivery_mode:
+        if _target_visible:
+            put_text(display,
+                     f"DELIVERY MATCH ({_last_match_info})  "
+                     f"N={_last_north_m:.3f}m E={_last_east_m:.3f}m",
+                     (10, 120), (0, 255, 0))
+        else:
+            put_text(display, f"DELIVERY: no match ({_last_match_info})",
+                     (10, 120), (0, 0, 255))
+    elif _confirmed_target is not None:
         put_text(display,
-                 f"TARGET: {_confirmed_target}  "
-                 f"N={_last_north_m:.3f}m E={_last_east_m:.3f}m",
+                 f"TARGET: {_confirmed_target!r}  "
+                 f"N={_last_north_m:.3f}m E={_last_east_m:.3f}m  "
+                 f"ref={'yes' if reference_ready() else 'no'}",
                  (10, 120), (0, 255, 0))
     else:
         put_text(display, "Searching...", (10, 120), (0, 0, 255))
@@ -504,14 +782,6 @@ def draw_overlay(display, detections, blur_score, sharp, fps,
                  (10, info_y), (220,220,220), 0.5, 1)
         info_y += 22
 
-        if t and t.confirmed:
-            n, e = pixel_to_ned_offset(
-                off_x, off_y, _live_altitude_m, original_width)
-            put_text(display,
-                     f"  N={n}m  E={e}m",
-                     (10, info_y), (0,255,0), 0.5, 1)
-            info_y += 22
-
     put_text(display, f"Tracks: {len(tracks)}",
              (10, original_height - 20))
 
@@ -523,11 +793,7 @@ def draw_overlay(display, detections, blur_score, sharp, fps,
 # ============================================================
 
 def resolve_camera_index():
-    """
-    Pick the IMX519's camera index. Multiple cameras may be attached
-    (e.g. an imx500 AI camera alongside the imx519), and Picamera2()
-    with no argument opens index 0, which may be the wrong sensor.
-    """
+    """Pick the IMX519's camera index (Pi has multiple cameras)."""
 
     if CAMERA_INDEX is not None:
         return CAMERA_INDEX
@@ -612,41 +878,35 @@ def start_camera():
 
 
 # ============================================================
-# MAIN — standalone test
+# MAIN - standalone bench test
 # ============================================================
 
 def main():
     camera, focus_mode = start_camera()
 
-    frame_counter = fps_counter = 0
-    fps = 0.0
-    fps_start = last_fps_log = time.perf_counter()
+    fps_counter        = 0
+    fps                = 0.0
+    fps_start          = last_fps_log = time.perf_counter()
+    lens_pos           = 0.0
+    lens_fetch_counter = 0
 
-    logging.info("Running. Keys: q quit | a AF once | c continuous | s save")
+    logging.info("Keys: q quit | a AF once | c continuous | s save | "
+                 "d delivery search (match vs reference) | x full reset")
+    logging.info("Bench test: show QR A -> confirm -> press d -> show QR A "
+                 "(MATCH) then QR B (no match)")
 
     try:
         while True:
             loop_start = time.perf_counter()
 
-            frame          = camera.capture_array()
+            frame = camera.capture_array()
             original_h, original_w = frame.shape[:2]
 
-            blur_score     = sharpness_score(frame)
-            sharp          = (not BLUR_GATE_ENABLED or
-                              blur_score > BLUR_THRESHOLD)
+            blur_score = sharpness_score(frame)
+            sharp      = (not BLUR_GATE_ENABLED or
+                          blur_score > BLUR_THRESHOLD)
 
-            processed, sx, sy = preprocess_frame(frame)
-            detections        = []
-
-            if sharp:
-                detections = detect_qrs(processed)
-                for det in detections:
-                    det.cx      *= sx;  det.cy      *= sy
-                    det.corners[:, 0] *= sx
-                    det.corners[:, 1] *= sy
-
-            # ── Pass image size so tracking can update FSM globals ──
-            update_tracks(detections, original_w, original_h)
+            detections = process_frame(frame) or []
 
             processing_ms = (time.perf_counter() - loop_start) * 1000.0
 
@@ -659,21 +919,26 @@ def main():
 
             if now - last_fps_log >= FPS_LOG_INTERVAL:
                 logging.info("FPS=%.1f | proc=%.0f ms | blur=%.1f | "
-                             "tracks=%d | target=%s",
+                             "tracks=%d | target=%r | delivery=%s | "
+                             "visible=%s | %s",
                              fps, processing_ms, blur_score,
-                             len(tracks), _confirmed_target)
+                             len(tracks), _confirmed_target,
+                             _delivery_mode, _target_visible,
+                             _last_match_info)
                 last_fps_log = now
 
             if SHOW_PREVIEW:
-                display   = frame.copy()
-                lens_pos  = (camera.capture_metadata()
-                             .get("LensPosition", 0.0))
-                display   = draw_overlay(
+                display            = frame.copy()
+                lens_fetch_counter += 1
+                if lens_fetch_counter % 10 == 0:
+                    lens_pos = (camera.capture_metadata()
+                                .get("LensPosition", 0.0))
+                display = draw_overlay(
                     display, detections, blur_score, sharp,
                     fps, processing_ms, focus_mode, lens_pos,
                     original_w, original_h
                 )
-                scale   = DISPLAY_WIDTH / original_w
+                scale = DISPLAY_WIDTH / original_w
                 if scale < 1.0:
                     display = cv2.resize(
                         display,
@@ -692,6 +957,11 @@ def main():
                     path = BASE_DIR / "capture.jpg"
                     cv2.imwrite(str(path), frame)
                     logging.info("Saved %s", path)
+                elif key == ord("d"):
+                    reset_detection(keep_reference=True)
+                    start_delivery_search()
+                elif key == ord("x"):
+                    reset_detection(keep_reference=False)
 
     except KeyboardInterrupt:
         logging.info("Stopped by user")
@@ -704,7 +974,7 @@ def main():
         logging.info("Shutdown complete")
         if tracks:
             for t in tracks.values():
-                logging.info("Track %d | %s | confirmed=%s",
+                logging.info("Track %d | %r | confirmed=%s",
                              t.track_id, t.text, t.confirmed)
 
 

@@ -62,7 +62,7 @@ def read_tfmini_s(bus, address):
         if (len(data) == 9 and
                 data[0] == 0x59 and data[1] == 0x59 and
                 (sum(data[0:8]) & 0xFF) == data[8]):
-            return data[2] + (data[3] << 8)
+            return data[2] + (data[3] << 8) + 5
     except Exception:
         pass
     return None
