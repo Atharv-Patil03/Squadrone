@@ -15,6 +15,9 @@ Fixes vs previous version:
     - Alignment has a timeout and holds position when the target is lost
     - Every failure path lands instead of exit()-ing in the air
     - Mode check compares custom_mode (no deprecated mode_string_v10)
+    - S2 scan uses GUIDED + zero velocity hold (not LOITER — avoids sink)
+    - land_and_disarm waits for baro settle after mode switch
+    - arm_and_takeoff streams position data before takeoff command
 
 TEST WITH PROPS OFF / TETHERED FIRST.
 """
@@ -56,8 +59,6 @@ LENS_POSITION    = None     # None = continuous AF; float = fixed (dioptres)
 FOCAL_LENGTH_MM  = 4.28
 PIXEL_SIZE_UM    = 1.22
 SENSOR_FULL_WIDTH_PX = 4656
-# Clockwise rotation of the camera image relative to the drone's nose.
-# 0 = image top points forward (nose). 90 = image top points to the right.
 CAMERA_ROTATION_DEG = 0
 
 BLUR_GATE_ENABLED = False
@@ -79,7 +80,6 @@ def connect(port, baud):
     mav.wait_heartbeat()
     print(f"Connected — System {mav.target_system}")
 
-    # Make sure altitude is streamed (10 Hz GLOBAL_POSITION_INT)
     mav.mav.command_long_send(
         mav.target_system, mav.target_component,
         mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
@@ -106,7 +106,6 @@ def set_mode(mav, mode_name):
 
 
 def get_altitude(mav):
-    """Altitude above home in metres (last known value if no new message)."""
     global _last_alt_m
     msg = mav.recv_match(type='GLOBAL_POSITION_INT',
                          blocking=True, timeout=1)
@@ -153,6 +152,13 @@ def arm_and_takeoff(mav, altitude_m):
     )
     time.sleep(2)
 
+    # FIXED — stream position data before takeoff command
+    mav.mav.request_data_stream_send(
+        mav.target_system, mav.target_component,
+        mavutil.mavlink.MAV_DATA_STREAM_ALL, 10, 1
+    )
+    time.sleep(0.5)
+
     mav.mav.command_long_send(
         mav.target_system, mav.target_component,
         mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
@@ -166,12 +172,14 @@ def arm_and_takeoff(mav, altitude_m):
         print(f"  Altitude: {alt:.2f}m", end='\r')
         if alt >= altitude_m * 0.95:
             print(f"\nReached {alt:.2f}m")
+            time.sleep(2)   # FIXED — stabilise after takeoff
             return True
     return False
 
 
 def land_and_disarm(mav):
     set_mode(mav, 'LAND')
+    time.sleep(2)           # FIXED — wait for baro to settle
     print("Landing...")
     start = time.time()
     while time.time() - start < 40:
@@ -180,7 +188,7 @@ def land_and_disarm(mav):
         if alt < 0.5:
             print("\nLanded")
             break
-    time.sleep(2)
+    time.sleep(3)           # FIXED — confirm fully settled
     mav.mav.command_long_send(
         mav.target_system, mav.target_component,
         mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
@@ -256,9 +264,6 @@ def is_sharp(frame):
 
 
 def detect_qr(frame):
-    """Returns (text, cx, cy) in frame pixels, or (None, None, None).
-    Picamera2 "RGB888" arrays are already BGR-ordered for OpenCV."""
-
     if wechat is not None:
         try:
             texts, points = wechat.detectAndDecode(frame)
@@ -285,8 +290,6 @@ def detect_qr(frame):
 
 # ─── GROUND OFFSET ────────────────────────────────────────────────
 def pixel_to_body_offset(offset_x_px, offset_y_px, altitude_m, frame_w_px):
-    """Image offset -> (forward_m, right_m) in the drone body frame."""
-
     used_sensor_width_mm = sensor_crop_width_px * (PIXEL_SIZE_UM / 1000.0)
     ground_width_m = altitude_m * used_sensor_width_mm / FOCAL_LENGTH_MM
     gsd = ground_width_m / frame_w_px
@@ -294,7 +297,6 @@ def pixel_to_body_offset(offset_x_px, offset_y_px, altitude_m, frame_w_px):
     img_right = offset_x_px * gsd
     img_down = offset_y_px * gsd
 
-    # Rotate image axes into body axes (camera mounting angle)
     a = math.radians(CAMERA_ROTATION_DEG)
     forward = -img_down * math.cos(a) + img_right * math.sin(a)
     right = img_right * math.cos(a) + img_down * math.sin(a)
@@ -304,7 +306,6 @@ def pixel_to_body_offset(offset_x_px, offset_y_px, altitude_m, frame_w_px):
 
 # ─── SEARCH PATTERN ───────────────────────────────────────────────
 def execute_search_pattern(mav):
-    """Small body-frame plus pattern (~0.9 m per leg)."""
     print("Executing search pattern...")
     for fwd, rgt in [(0.3, 0.0), (-0.3, 0.0), (0.0, 0.3), (0.0, -0.3)]:
         send_velocity(mav, fwd, rgt, duration_s=3)
@@ -315,7 +316,9 @@ def execute_search_pattern(mav):
 # ─── S2: INITIAL QR SCAN ──────────────────────────────────────────
 def state_qr_scan(mav, cam):
     print("\n── S2: Initial QR Scan ──")
-    set_mode(mav, 'LOITER')
+    # FIXED — stay in GUIDED, hold position with zero velocity
+    # LOITER was causing altitude sink on mode switch
+    set_mode(mav, 'GUIDED')
     time.sleep(1.5)
 
     history = []
@@ -324,6 +327,9 @@ def state_qr_scan(mav, cam):
 
     while True:
         frame = cam.capture_array()
+
+        # Hold position while scanning
+        send_velocity(mav, 0, 0, duration_s=0.1)
 
         text = None
         if is_sharp(frame):
@@ -341,16 +347,13 @@ def state_qr_scan(mav, cam):
                 return text
             continue
 
-        # No usable detection this frame (blurry or nothing found)
         history.clear()
 
         if time.time() - scan_start > SEARCH_TIMEOUT:
             if retries >= MAX_RETRIES:
                 print("  ERROR: QR not found after max retries")
                 return None
-            set_mode(mav, 'GUIDED')
             execute_search_pattern(mav)
-            set_mode(mav, 'LOITER')
             time.sleep(1.5)
             retries += 1
             scan_start = time.time()
@@ -379,7 +382,7 @@ def state_alignment(mav, cam, delivery_target):
             aligned_count = 0
             print(f"  Wrong QR: {text} — holding" if text
                   else "  No QR detected — holding")
-            send_velocity(mav, 0, 0, duration_s=0.2)   # hold position
+            send_velocity(mav, 0, 0, duration_s=0.2)
             continue
 
         offset_x_px = cx - frame_w / 2
@@ -395,8 +398,7 @@ def state_alignment(mav, cam, delivery_target):
 
         if distance < ALIGN_THRESHOLD:
             aligned_count += 1
-            print(f"  Within threshold "
-                  f"({aligned_count}/{ALIGNED_REQUIRED})")
+            print(f"  Within threshold ({aligned_count}/{ALIGNED_REQUIRED})")
             if aligned_count >= ALIGNED_REQUIRED:
                 print("  ALIGNED")
                 stop(mav)
@@ -432,7 +434,6 @@ if __name__ == "__main__":
 
         print(f"\nDelivery target stored: {delivery_target}")
 
-        # For this test, the matching QR is on the ground below the drone.
         aligned = state_alignment(mav, cam, delivery_target)
 
         if aligned:
