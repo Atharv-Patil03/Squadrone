@@ -18,8 +18,11 @@ Fixes vs previous version:
     - S2 scan uses GUIDED + zero velocity hold (not LOITER — avoids sink)
     - land_and_disarm waits for baro to settle after mode switch
     - arm_and_takeoff streams position data before takeoff command
-    - Search pattern is now an expanding spiral (1.5m → 2.5m → 3.5m steps)
-      so a QR placed 5-6m away is found within 2 retries
+    - Search pattern is now a CROSS pattern — drone goes out and returns
+      to center on each arm, so it never drifts more than step_m from
+      the scan origin. Actively scans at each pause point.
+    - Step sizes are smaller (1.2 → 2.0 → 2.8m) tuned for 5m altitude
+      where FOV is ~4m wide — avoids wandering toward obstacles/trees.
 
 TEST WITH PROPS OFF / TETHERED FIRST.
 """
@@ -48,8 +51,8 @@ ALIGN_THRESHOLD  = 0.15     # metres
 MAX_SPEED        = 0.3      # m/s
 KP               = 0.4
 CONSENSUS_REQ    = 3
-SEARCH_TIMEOUT   = 10.0     # s before triggering a search move (was 8.0)
-MAX_RETRIES      = 4        # spiral attempts before giving up (was 3)
+SEARCH_TIMEOUT   = 10.0     # s scanning at current position before moving
+MAX_RETRIES      = 3        # cross-pattern attempts before giving up
 ALIGN_TIMEOUT    = 60.0     # s total for S6
 ALIGNED_REQUIRED = 3
 
@@ -310,45 +313,72 @@ def pixel_to_body_offset(offset_x_px, offset_y_px, altitude_m, frame_w_px):
     return round(forward, 4), round(right, 4)
 
 
+# ─── SCAN AT POSITION ─────────────────────────────────────────────
+def scan_at_position(mav, cam, duration_s=1.5):
+    """
+    Hold position and actively scan for QR for duration_s seconds.
+    Returns QR text string if found, None otherwise.
+    Sends zero-velocity hold commands while scanning so drone stays put.
+    """
+    end = time.time() + duration_s
+    while time.time() < end:
+        send_velocity(mav, 0, 0, duration_s=0.1)
+        frame = cam.capture_array()
+        if is_sharp(frame):
+            text, _, _ = detect_qr(frame)
+            if text:
+                return text
+    return None
+
+
 # ─── SEARCH PATTERN ───────────────────────────────────────────────
-def execute_search_pattern(mav, retry_num=0):
+def execute_search_pattern(mav, cam, retry_num=0):
     """
-    Expanding square spiral — each retry searches further out.
+    Cross pattern — drone goes out on each arm then returns to center.
+    Maximum drift from scan origin = step_m (never accumulates).
 
-    retry 0 → 1.5m steps  (covers ~3×3m area)
-    retry 1 → 2.5m steps  (covers ~5×5m area)
-    retry 2 → 3.5m steps  (covers ~7×7m area)
-    retry 3 → 4.5m steps  (covers ~9×9m area)
+    At 5m altitude, camera FOV ≈ 4m wide × 2.3m tall.
+    Step sizes are tuned so each arm reaches just beyond one FOV width:
+      retry 0 → 1.2m steps  (safe, close-in search)
+      retry 1 → 2.0m steps  (medium range)
+      retry 2 → 2.8m steps  (far range — QR 4-5m away)
 
-    A QR placed 5-6m away from the drone will be found on retry 1 or 2.
-    Speed is 0.4 m/s so moves are deliberate but not jerky.
-    After each leg the drone stops and pauses 0.5s so the camera
-    has time to capture a still frame before moving on.
+    Drone scans actively for 1.5s at each arm endpoint before returning.
+    If QR found mid-pattern, returns text immediately.
     """
-    step = 1.5 + retry_num * 1.0   # metres per leg
-    spd  = 0.4                      # m/s
+    # Step size grows with each retry
+    step = 1.2 + retry_num * 0.8   # 1.2 → 2.0 → 2.8 m
+    spd  = 0.3                      # m/s — slow enough to scan cleanly
+    dur  = step / spd               # seconds to travel one arm
 
-    dur = step / spd   # seconds per leg
+    print(f"  Search cross retry {retry_num} — step={step:.1f}m ...")
 
-    print(f"  Search pattern retry {retry_num} — step={step:.1f}m ...")
-
-    # Classic expanding square: N, E, S, S, W, W, N, N
-    moves = [
-        ( step,   0,    dur),
-        ( 0,      step, dur),
-        (-step,   0,    dur),
-        (-step,   0,    dur),
-        ( 0,     -step, dur),
-        ( 0,     -step, dur),
-        ( step,   0,    dur),
+    # 4 arms: forward, back, right, left — each returns to center
+    arms = [
+        ( step,  0),    # forward
+        (-step,  0),    # right
+        ( 0,  step),    # backward
+        ( 0, -step),    # left
     ]
 
-    for fwd, rgt, d in moves:
-        send_velocity(mav, fwd, rgt, duration_s=d)
+    for fwd, rgt in arms:
+        # Move out to arm endpoint
+        send_velocity(mav, fwd, rgt, duration_s=dur)
         stop(mav)
-        time.sleep(0.5)   # pause so camera can grab a still frame
+
+        # Actively scan at this position
+        found = scan_at_position(mav, cam, duration_s=1.5)
+        if found:
+            print(f"  QR found mid-pattern: {found}")
+            return found
+
+        # Return to center
+        send_velocity(mav, -fwd, -rgt, duration_s=dur)
+        stop(mav)
+        time.sleep(0.3)   # brief settle at center
 
     print("  Search pattern complete — resuming scan")
+    return None
 
 
 # ─── S2: INITIAL QR SCAN ──────────────────────────────────────────
@@ -391,8 +421,16 @@ def state_qr_scan(mav, cam):
             if retries >= MAX_RETRIES:
                 print("  ERROR: QR not found after max retries")
                 return None
-            execute_search_pattern(mav, retry_num=retries)
-            time.sleep(1.5)
+
+            # Run cross pattern — may find QR mid-pattern
+            found = execute_search_pattern(mav, cam, retry_num=retries)
+            if found:
+                # Got it mid-pattern — confirm with consensus
+                history = [found]
+                retries = 0
+                scan_start = time.time()
+                continue
+
             retries += 1
             scan_start = time.time()
 
