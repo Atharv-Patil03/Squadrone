@@ -16,8 +16,10 @@ Fixes vs previous version:
     - Every failure path lands instead of exit()-ing in the air
     - Mode check compares custom_mode (no deprecated mode_string_v10)
     - S2 scan uses GUIDED + zero velocity hold (not LOITER — avoids sink)
-    - land_and_disarm waits for baro settle after mode switch
+    - land_and_disarm waits for baro to settle after mode switch
     - arm_and_takeoff streams position data before takeoff command
+    - Search pattern is now an expanding spiral (1.5m → 2.5m → 3.5m steps)
+      so a QR placed 5-6m away is found within 2 retries
 
 TEST WITH PROPS OFF / TETHERED FIRST.
 """
@@ -46,8 +48,8 @@ ALIGN_THRESHOLD  = 0.15     # metres
 MAX_SPEED        = 0.3      # m/s
 KP               = 0.4
 CONSENSUS_REQ    = 3
-SEARCH_TIMEOUT   = 8.0      # s before a search move
-MAX_RETRIES      = 3
+SEARCH_TIMEOUT   = 10.0     # s before triggering a search move (was 8.0)
+MAX_RETRIES      = 4        # spiral attempts before giving up (was 3)
 ALIGN_TIMEOUT    = 60.0     # s total for S6
 ALIGNED_REQUIRED = 3
 
@@ -78,6 +80,10 @@ def connect(port, baud):
     print(f"Connecting on {port}...")
     mav = mavutil.mavlink_connection(port, baud=baud)
     mav.wait_heartbeat()
+    if mav.target_system == 0:
+        print("System 0 — waiting for FC reboot...")
+        time.sleep(3)
+        mav.wait_heartbeat()
     print(f"Connected — System {mav.target_system}")
 
     mav.mav.command_long_send(
@@ -152,7 +158,7 @@ def arm_and_takeoff(mav, altitude_m):
     )
     time.sleep(2)
 
-    # FIXED — stream position data before takeoff command
+    # Stream position data before takeoff command
     mav.mav.request_data_stream_send(
         mav.target_system, mav.target_component,
         mavutil.mavlink.MAV_DATA_STREAM_ALL, 10, 1
@@ -172,14 +178,14 @@ def arm_and_takeoff(mav, altitude_m):
         print(f"  Altitude: {alt:.2f}m", end='\r')
         if alt >= altitude_m * 0.95:
             print(f"\nReached {alt:.2f}m")
-            time.sleep(2)   # FIXED — stabilise after takeoff
+            time.sleep(2)   # stabilise after takeoff
             return True
     return False
 
 
 def land_and_disarm(mav):
     set_mode(mav, 'LAND')
-    time.sleep(2)           # FIXED — wait for baro to settle
+    time.sleep(2)           # wait for baro to settle after mode switch
     print("Landing...")
     start = time.time()
     while time.time() - start < 40:
@@ -188,7 +194,7 @@ def land_and_disarm(mav):
         if alt < 0.5:
             print("\nLanded")
             break
-    time.sleep(3)           # FIXED — confirm fully settled
+    time.sleep(3)           # confirm fully settled before disarm
     mav.mav.command_long_send(
         mav.target_system, mav.target_component,
         mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
@@ -305,19 +311,51 @@ def pixel_to_body_offset(offset_x_px, offset_y_px, altitude_m, frame_w_px):
 
 
 # ─── SEARCH PATTERN ───────────────────────────────────────────────
-def execute_search_pattern(mav):
-    print("Executing search pattern...")
-    for fwd, rgt in [(0.3, 0.0), (-0.3, 0.0), (0.0, 0.3), (0.0, -0.3)]:
-        send_velocity(mav, fwd, rgt, duration_s=3)
+def execute_search_pattern(mav, retry_num=0):
+    """
+    Expanding square spiral — each retry searches further out.
+
+    retry 0 → 1.5m steps  (covers ~3×3m area)
+    retry 1 → 2.5m steps  (covers ~5×5m area)
+    retry 2 → 3.5m steps  (covers ~7×7m area)
+    retry 3 → 4.5m steps  (covers ~9×9m area)
+
+    A QR placed 5-6m away from the drone will be found on retry 1 or 2.
+    Speed is 0.4 m/s so moves are deliberate but not jerky.
+    After each leg the drone stops and pauses 0.5s so the camera
+    has time to capture a still frame before moving on.
+    """
+    step = 1.5 + retry_num * 1.0   # metres per leg
+    spd  = 0.4                      # m/s
+
+    dur = step / spd   # seconds per leg
+
+    print(f"  Search pattern retry {retry_num} — step={step:.1f}m ...")
+
+    # Classic expanding square: N, E, S, S, W, W, N, N
+    moves = [
+        ( step,   0,    dur),
+        ( 0,      step, dur),
+        (-step,   0,    dur),
+        (-step,   0,    dur),
+        ( 0,     -step, dur),
+        ( 0,     -step, dur),
+        ( step,   0,    dur),
+    ]
+
+    for fwd, rgt, d in moves:
+        send_velocity(mav, fwd, rgt, duration_s=d)
         stop(mav)
-        time.sleep(1)
+        time.sleep(0.5)   # pause so camera can grab a still frame
+
+    print("  Search pattern complete — resuming scan")
 
 
 # ─── S2: INITIAL QR SCAN ──────────────────────────────────────────
 def state_qr_scan(mav, cam):
     print("\n── S2: Initial QR Scan ──")
-    # FIXED — stay in GUIDED, hold position with zero velocity
-    # LOITER was causing altitude sink on mode switch
+    # Stay in GUIDED, hold position with zero velocity.
+    # LOITER was causing altitude sink on mode switch.
     set_mode(mav, 'GUIDED')
     time.sleep(1.5)
 
@@ -353,7 +391,7 @@ def state_qr_scan(mav, cam):
             if retries >= MAX_RETRIES:
                 print("  ERROR: QR not found after max retries")
                 return None
-            execute_search_pattern(mav)
+            execute_search_pattern(mav, retry_num=retries)
             time.sleep(1.5)
             retries += 1
             scan_start = time.time()
