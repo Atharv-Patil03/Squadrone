@@ -145,16 +145,23 @@ class Drone:
             elif t == "STATUSTEXT":
                 print(f"  [FC] {msg.text}")
 
-    def wait_gps(self, timeout=60):
+    def wait_gps(self, timeout=120):
         print("Waiting for GPS 3D fix…")
         t0 = time.time()
         while time.time()-t0 < timeout:
             self.update()
-            gps = self.master.recv_match(type="GPS_RAW_INT", blocking=True, timeout=1)
+            try:
+                gps = self.master.recv_match(type="GPS_RAW_INT", blocking=False)
+            except Exception:
+                gps = None
             if gps and gps.fix_type >= 3 and self.lat is not None:
                 print(f"GPS ✓  {self.lat:.7f}, {self.lon:.7f}  "
                       f"HDOP={gps.eph/100:.2f}")
                 return
+            elapsed = int(time.time()-t0)
+            if elapsed % 5 == 0:
+                print(f"  waiting… {elapsed}s", end="\r")
+            time.sleep(0.5)
         raise RuntimeError("No GPS fix — check antenna")
 
     def set_param(self, name, value):
