@@ -62,10 +62,10 @@ ARDUCAM_INDEX    = None    # None = auto-detect ArduCam; set 0 or 1 to force
 # Banner detection (HSV green)
 LOWER_GREEN        = np.array([35,  80,  50])
 UPPER_GREEN        = np.array([85, 255, 255])
-MIN_AREA           = 500
-MIN_ASPECT_RATIO   = 0.3
-MAX_ASPECT_RATIO   = 3.5
-MIN_RECTANGULARITY = 0.35
+MIN_AREA           = 300    # lowered — banner may be far away and small
+MIN_ASPECT_RATIO   = 0.2    # relaxed — partial view at low altitude
+MAX_ASPECT_RATIO   = 5.0    # relaxed — same
+MIN_RECTANGULARITY = 0.20   # relaxed — partial frame fill at low alt
 
 # Alignment
 ALIGN_THRESHOLD_PX = 30    # centroid must be within this of frame centre
@@ -330,8 +330,8 @@ def state_align_to_banner(mav, cam):
         if banner is None:
             align_count  = 0
             no_banner_ct += 1
-            log.info(f"  No banner ({no_banner_ct}) — "
-                     + ("creeping forward" if no_banner_ct > 20 else "holding"))
+            action = "creeping forward" if no_banner_ct > 20 else "holding"
+            log.info(f"  NO BANNER DETECTED (frame {no_banner_ct}) — {action}")
             if no_banner_ct > 20:
                 # Banner is in front — creep forward to bring it into view
                 send_velocity(mav, SEARCH_CREEP_SPD, 0, duration_s=0.5)
@@ -402,15 +402,21 @@ def state_land_on_banner(mav, cam):
             stop_drone(mav)
             time.sleep(0.5)
             set_mode(mav, 'LAND')
-            log.info("  LAND mode active — waiting for touchdown")
-            # Wait for disarm (altitude near 0 and motors disarm)
+            log.info("  LAND mode active — waiting for touchdown…")
+            # Wait for disarm OR altitude near zero
             start = time.time()
-            while time.time() - start < 30:
+            while time.time() - start < 45:
                 if not mav.motors_armed():
-                    log.info("  Landed and disarmed ✓")
+                    log.info("  ✓ Landed and disarmed automatically")
+                    return True
+                alt_now = get_altitude(mav)
+                log.info(f"  Landing… alt={alt_now:.2f}m  armed={mav.motors_armed()}")
+                if alt_now < 0.15:
+                    log.info("  ✓ Altitude near zero — touchdown confirmed")
+                    time.sleep(3)   # let ArduCopter disarm on its own
                     return True
                 time.sleep(1)
-            log.warning("  Land timeout — drone may still be on ground")
+            log.warning("  Land timeout (45s) — check drone manually")
             return True
 
         # Capture frame and keep centred while descending
@@ -422,14 +428,14 @@ def state_land_on_banner(mav, cam):
             cx, cy = banner["center"]
             offset_x = cx - cx_frame
             offset_y = cy - cy_frame
-            log.info(f"  Banner offset: ({offset_x:+d},{offset_y:+d})px")
+            log.info(f"  Banner: ({cx},{cy})  offset: ({offset_x:+d},{offset_y:+d})px  area:{banner['area']}")
 
             vright   = max(-ALIGN_SPEED,
                            min(ALIGN_SPEED,  offset_x * PX_SCALE_X))
             vforward = max(-ALIGN_SPEED,
                            min(ALIGN_SPEED, -offset_y * PX_SCALE_Y))
         else:
-            log.info("  Banner lost during descent — holding lateral")
+            log.info("  Banner NOT DETECTED during descent (may fill frame) — holding lateral, continuing down")
             vforward = 0.0
             vright   = 0.0
 
