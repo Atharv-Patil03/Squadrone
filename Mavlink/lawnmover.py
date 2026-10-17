@@ -320,7 +320,20 @@ def main():
 
     # ── Connect ────────────────────────────────────────────────────
     drone = Drone(args.conn, args.baud)
-    drone.wait_gps()
+    try:
+        drone.wait_gps()
+    except KeyboardInterrupt:
+        print("\nGPS wait skipped by user — using FC position")
+        if drone.lat is None:
+            # Force-read one position message
+            for _ in range(20):
+                drone.update()
+                time.sleep(0.1)
+                if drone.lat is not None:
+                    break
+        if drone.lat is None:
+            raise RuntimeError("No position from FC — cannot plan path")
+        print(f"Position: {drone.lat:.7f}, {drone.lon:.7f}")
 
     # Re-plan from actual drone position
     drone_xy = latlon_to_xy(drone.lat, drone.lon, *origin)
