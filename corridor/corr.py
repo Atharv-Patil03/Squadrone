@@ -201,11 +201,17 @@ def log_lidar(front, left, right):
 def connect_mavlink():
     log.info(f"Connecting to {SERIAL_PORT} @ {BAUD_RATE}…")
     mav = mavutil.mavlink_connection(SERIAL_PORT, baud=BAUD_RATE)
-    mav.wait_heartbeat()
+    # Wait for a heartbeat with a valid (non-zero) system ID.
+    # First packet can arrive before FC sets its sysid → target_system=0.
+    for attempt in range(20):
+        mav.wait_heartbeat(timeout=3)
+        if mav.target_system != 0:
+            break
+        log.info(f"  target_system=0 (attempt {attempt+1}/20), retrying…")
+    else:
+        raise RuntimeError("target_system=0 after 20 attempts — check connection")
     log.info(f"Heartbeat from system {mav.target_system} "
              f"component {mav.target_component}")
-    if mav.target_system == 0:
-        raise RuntimeError("target_system is 0 — check connection")
     return mav
 
 def set_mode(mav, mode_name):

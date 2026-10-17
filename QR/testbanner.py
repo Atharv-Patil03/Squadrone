@@ -177,11 +177,18 @@ def detect_banner(frame):
 def connect_mavlink():
     log.info(f"Connecting {SERIAL_PORT} @ {BAUD_RATE}…")
     mav = mavutil.mavlink_connection(SERIAL_PORT, baud=BAUD_RATE)
-    mav.wait_heartbeat()
+    # Wait until we get a heartbeat with a valid (non-zero) system ID.
+    # The first heartbeat packet sometimes arrives before the FC has set
+    # its sysid, giving target_system=0. Keep reading until it's non-zero.
+    for attempt in range(20):
+        mav.wait_heartbeat(timeout=3)
+        if mav.target_system != 0:
+            break
+        log.info(f"  target_system=0 (attempt {attempt+1}/20), retrying…")
+    else:
+        raise RuntimeError("target_system=0 after 20 attempts — check connection — RTL !!!")
     log.info(f"Heartbeat — system {mav.target_system} "
              f"component {mav.target_component}")
-    if mav.target_system == 0:
-        raise RuntimeError("target_system=0 — check connection")
     return mav
 
 def set_mode(mav, mode_name):
