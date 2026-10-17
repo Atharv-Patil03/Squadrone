@@ -494,7 +494,7 @@ def state_align_to_banner(mav, cam):
         else:
             align_count = 0
             # Proportional speed — but enforce minimum so drone actually moves
-            raw_vx = -offset_y * PX_SCALE_Y   # forward/back
+            raw_vx = +offset_y * PX_SCALE_Y   # forward/back
             raw_vy =  offset_x * PX_SCALE_X   # left/right
 
             # Apply minimum speed in the direction needed
