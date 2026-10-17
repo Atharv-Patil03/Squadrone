@@ -27,10 +27,22 @@ TOP of frame when drone is hovering forward of it.
 import cv2
 import time
 import logging
+import os
 import numpy as np
+from collections import deque
 
 from picamera2 import Picamera2
 from pymavlink import mavutil
+
+# ── DEBUG PREVIEW ─────────────────────────────────────────────────────────────
+# Set SHOW_WINDOW=True only if Pi has a display connected (HDMI).
+# DEBUG_SAVE_DIR: saves an annotated JPEG every DEBUG_SAVE_INTERVAL frames
+#   → view on laptop:  scp pi@<PI_IP>:~/squadrone/debug_frame.jpg .
+#   or watch live:     watch -n1 'scp pi@<PI_IP>:~/squadrone/debug_frame.jpg . && eog debug_frame.jpg'
+SHOW_WINDOW          = True          # True = cv2 window (needs display)
+DEBUG_SAVE_DIR       = os.path.expanduser("~/squadrone")
+DEBUG_SAVE_INTERVAL  = 5             # save every N frames
+_debug_frame_count   = 0
 
 # ──────────────────────────────────────────────────────────────────────────────
 # LOGGING
@@ -52,7 +64,9 @@ BAUD_RATE   = 921600
 # Flight
 TAKEOFF_ALT_M     = 3.0    # cruise altitude for alignment
 TAKEOFF_THRESHOLD = 0.95   # fraction of target alt = takeoff done
-LAND_ALT_M        = 0.5    # descend to this before switching LAND mode
+LAND_ALT_M        = 2.0    # descend to this before switching LAND mode
+                           # Set above LAND_ALT_M ArduCopter param (your team set ~1.5m)
+                           # so LAND mode starts its slow-descent phase correctly
 
 # Camera
 CAM_WIDTH        = 640
@@ -68,10 +82,16 @@ MAX_ASPECT_RATIO   = 5.0    # relaxed — same
 MIN_RECTANGULARITY = 0.20   # relaxed — partial frame fill at low alt
 
 # Alignment
-ALIGN_THRESHOLD_PX = 30    # centroid must be within this of frame centre
-ALIGN_HOLD_FRAMES  = 15    # consecutive aligned frames → confirmed centred
-SEARCH_CREEP_SPD   = 0.2   # m/s — creep forward when banner not visible
-ALIGN_SPEED        = 0.25  # m/s — max correction speed during alignment
+ALIGN_THRESHOLD_PX = 50    # centroid must be within this of frame centre
+ALIGN_HOLD_FRAMES  = 5     # consecutive aligned frames → confirmed centred
+ALIGN_TIMEOUT_S    = 60    # if not aligned within this many seconds → descend anyway
+SEARCH_CREEP_SPD   = 0.3   # m/s — creep forward when banner not visible
+ALIGN_SPEED        = 0.4   # m/s — max correction speed
+MIN_MOVE_SPEED     = 0.15  # m/s — minimum speed sent (drone ignores < ~0.1 m/s)
+
+# Detection history (same as banner_detect.py)
+HISTORY_LENGTH     = 8     # frames in rolling window
+REQUIRED_DETECTIONS= 5     # detections needed in window to confirm banner
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CAMERA — auto-detect ArduCam (same technique as QR module)
@@ -129,11 +149,11 @@ def start_camera():
 
 _kernel = np.ones((5, 5), np.uint8)
 
-def detect_banner(frame):
-    """
-    Detect largest green banner in BGR frame.
-    Returns dict {center:(cx,cy), box:(x,y,w,h), area} or None.
-    """
+# Rolling detection history — same approach as banner_detect.py
+_detection_history = deque(maxlen=HISTORY_LENGTH)
+
+def _find_banner_raw(frame):
+    """Raw single-frame detection. Returns dict or None."""
     hsv  = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, LOWER_GREEN, UPPER_GREEN)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  _kernel)
@@ -169,6 +189,77 @@ def detect_banner(frame):
             best = {"center": (cx, cy), "box": (x, y, w, h), "area": area}
 
     return best
+
+
+def detect_banner(frame):
+    """
+    Stable detection using rolling history window (same as banner_detect.py).
+    Returns averaged centroid dict if REQUIRED_DETECTIONS in last HISTORY_LENGTH frames,
+    else None.
+    """
+    raw = _find_banner_raw(frame)
+    _detection_history.append(raw)
+
+    detections = [d for d in _detection_history if d is not None]
+    if len(detections) < REQUIRED_DETECTIONS:
+        return None
+
+    # Average centroid and area over recent detections
+    cx = int(sum(d["center"][0] for d in detections) / len(detections))
+    cy = int(sum(d["center"][1] for d in detections) / len(detections))
+    area = sum(d["area"] for d in detections) / len(detections)
+    return {"center": (cx, cy), "area": area}
+
+
+def reset_detection_history():
+    """Call when re-entering a detection phase to clear stale frames."""
+    _detection_history.clear()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DEBUG PREVIEW
+# ──────────────────────────────────────────────────────────────────────────────
+
+def draw_debug(frame, banner, offset_x=None, offset_y=None, label=""):
+    """
+    Draw detection overlay on frame and save/show.
+    Call after detect_banner() with the same frame (BGR).
+    """
+    global _debug_frame_count
+    _debug_frame_count += 1
+
+    dbg = frame.copy()
+    cx_frame = CAM_WIDTH  // 2
+    cy_frame = CAM_HEIGHT // 2
+
+    # Crosshair at frame centre
+    cv2.line(dbg, (cx_frame - 20, cy_frame), (cx_frame + 20, cy_frame), (0, 255, 255), 1)
+    cv2.line(dbg, (cx_frame, cy_frame - 20), (cx_frame, cy_frame + 20), (0, 255, 255), 1)
+
+    if banner is not None:
+        cx, cy = banner["center"]
+        # Circle on detected centroid
+        cv2.circle(dbg, (cx, cy), 10, (0, 255, 0), 2)
+        # Line from frame centre to centroid
+        cv2.line(dbg, (cx_frame, cy_frame), (cx, cy), (0, 200, 0), 1)
+        txt = f"offset:({offset_x:+d},{offset_y:+d}) area:{int(banner['area'])}"
+        cv2.putText(dbg, txt, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    else:
+        cv2.putText(dbg, "NO BANNER", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+    if label:
+        cv2.putText(dbg, label, (10, CAM_HEIGHT - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+
+    # Save JPEG periodically
+    if _debug_frame_count % DEBUG_SAVE_INTERVAL == 0:
+        path = os.path.join(DEBUG_SAVE_DIR, "debug_frame.jpg")
+        cv2.imwrite(path, dbg)
+
+    # Optional live window
+    if SHOW_WINDOW:
+        cv2.imshow("Squadrone Camera", dbg)
+        cv2.waitKey(1)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # MAVLINK HELPERS
@@ -262,27 +353,30 @@ def arm_and_takeoff(mav, target_alt_m):
     log.warning("Takeoff timeout")
     return False
 
-def descend_to(mav, target_alt_m, timeout_s=15):
-    """Descend to target_alt_m using NED position setpoint."""
+def descend_to(mav, target_alt_m, timeout_s=30):
+    """Descend to target_alt_m using downward velocity setpoints."""
     log.info(f"Descending to {target_alt_m}m…")
-    mav.mav.set_position_target_local_ned_send(
-        0,
-        mav.target_system, mav.target_component,
-        mavutil.mavlink.MAV_FRAME_LOCAL_NED,
-        0b0000111111111000,   # only Z
-        0, 0, -target_alt_m,
-        0, 0, 0,
-        0, 0, 0,
-        0, 0
-    )
+    DESCEND_SPEED = 0.4   # m/s downward — faster descent
     start = time.time()
     while time.time() - start < timeout_s:
         alt = get_altitude(mav)
         log.info(f"  Alt: {alt:.2f}m → target {target_alt_m}m")
-        if abs(alt - target_alt_m) < 0.3:
+        if alt <= target_alt_m + 0.3:
             log.info(f"  Reached {alt:.2f}m")
+            stop_drone(mav)
             return True
-        time.sleep(0.5)
+        # Send downward velocity
+        mav.mav.set_position_target_local_ned_send(
+            0,
+            mav.target_system, mav.target_component,
+            mavutil.mavlink.MAV_FRAME_BODY_OFFSET_NED,
+            0b0000111111000111,  # velocity only
+            0, 0, 0,
+            0, 0, DESCEND_SPEED,   # vx=0, vy=0, vz=down
+            0, 0, 0,
+            0, 0
+        )
+        time.sleep(0.3)
     log.warning("Descend timeout")
     return False
 
@@ -319,8 +413,13 @@ def state_align_to_banner(mav, cam):
 
     align_count  = 0
     no_banner_ct = 0
+    align_start  = time.time()
 
     while True:
+        # Timeout — if we can't align in ALIGN_TIMEOUT_S, descend anyway
+        if time.time() - align_start > ALIGN_TIMEOUT_S:
+            log.warning(f"  Align timeout ({ALIGN_TIMEOUT_S}s) — descending anyway")
+            return True
         rgb   = cam.capture_array()
         frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
@@ -332,6 +431,7 @@ def state_align_to_banner(mav, cam):
             no_banner_ct += 1
             action = "creeping forward" if no_banner_ct > 20 else "holding"
             log.info(f"  NO BANNER DETECTED (frame {no_banner_ct}) — {action}")
+            draw_debug(frame, None, label=f"NO BANNER | {action}")
             if no_banner_ct > 20:
                 # Banner is in front — creep forward to bring it into view
                 send_velocity(mav, SEARCH_CREEP_SPD, 0, duration_s=0.5)
@@ -349,27 +449,40 @@ def state_align_to_banner(mav, cam):
         aligned = (abs(offset_x) <= ALIGN_THRESHOLD_PX and
                    abs(offset_y) <= ALIGN_THRESHOLD_PX)
 
+        status = f"ALIGNED {align_count}/{ALIGN_HOLD_FRAMES}" if aligned else "correcting"
         log.info(f"  Banner: ({cx},{cy})  "
                  f"offset: ({offset_x:+d},{offset_y:+d})px  "
-                 f"area: {banner['area']}  "
-                 f"{'ALIGNED' if aligned else 'correcting'}")
+                 f"area: {banner['area']}  {status}")
+        draw_debug(frame, banner, offset_x, offset_y, label=f"ALIGN | {status}")
 
         if aligned:
             align_count += 1
             stop_drone(mav)
+            log.info(f"  ALIGNED {align_count}/{ALIGN_HOLD_FRAMES}")
             if align_count >= ALIGN_HOLD_FRAMES:
                 log.info("  ✓ BANNER CENTRED AND STABLE")
                 return True
         else:
             align_count = 0
-            # offset_x +ve → banner right → vright positive
-            vright   = max(-ALIGN_SPEED,
-                           min(ALIGN_SPEED,  offset_x * PX_SCALE_X))
-            # offset_y +ve → banner behind → move backward (vforward negative)
-            # offset_y -ve → banner ahead  → move forward  (vforward positive)
-            vforward = max(-ALIGN_SPEED,
-                           min(ALIGN_SPEED, -offset_y * PX_SCALE_Y))
-            send_velocity(mav, vforward, vright, duration_s=0.2)
+            # Proportional speed — but enforce minimum so drone actually moves
+            raw_vx = -offset_y * PX_SCALE_Y   # forward/back
+            raw_vy =  offset_x * PX_SCALE_X   # left/right
+
+            # Apply minimum speed in the direction needed
+            if abs(raw_vx) > 0.01:
+                vforward = max(MIN_MOVE_SPEED, abs(raw_vx)) * (1 if raw_vx > 0 else -1)
+                vforward = max(-ALIGN_SPEED, min(ALIGN_SPEED, vforward))
+            else:
+                vforward = 0.0
+
+            if abs(raw_vy) > 0.01:
+                vright = max(MIN_MOVE_SPEED, abs(raw_vy)) * (1 if raw_vy > 0 else -1)
+                vright = max(-ALIGN_SPEED, min(ALIGN_SPEED, vright))
+            else:
+                vright = 0.0
+
+            log.info(f"  Moving: fwd={vforward:+.2f} right={vright:+.2f} m/s")
+            send_velocity(mav, vforward, vright, duration_s=0.3)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # STATE: LAND ON BANNER
@@ -385,19 +498,20 @@ def state_land_on_banner(mav, cam):
     At LAND_ALT_M → switch LAND mode → ArduCopter handles final touchdown.
     """
     log.info("\n── LAND ON BANNER ──")
+    reset_detection_history()   # clear history from align phase
 
     cx_frame = CAM_WIDTH  // 2
     cy_frame = CAM_HEIGHT // 2
     PX_SCALE_X = ALIGN_SPEED / (CAM_WIDTH  / 2)
     PX_SCALE_Y = ALIGN_SPEED / (CAM_HEIGHT / 2)
 
-    DESCEND_SPEED = 0.15   # m/s downward — slow descent
+    DESCEND_SPEED = 0.4   # m/s downward
 
     while True:
         alt = get_altitude(mav)
         log.info(f"  Alt: {alt:.2f}m")
 
-        if alt <= LAND_ALT_M:
+        if alt <= LAND_ALT_M + 0.3:
             log.info(f"  Reached {alt:.2f}m → switching to LAND")
             stop_drone(mav)
             time.sleep(0.5)
@@ -429,13 +543,15 @@ def state_land_on_banner(mav, cam):
             offset_x = cx - cx_frame
             offset_y = cy - cy_frame
             log.info(f"  Banner: ({cx},{cy})  offset: ({offset_x:+d},{offset_y:+d})px  area:{banner['area']}")
+            draw_debug(frame, banner, offset_x, offset_y, label=f"DESCEND | alt={alt:.2f}m")
 
             vright   = max(-ALIGN_SPEED,
                            min(ALIGN_SPEED,  offset_x * PX_SCALE_X))
             vforward = max(-ALIGN_SPEED,
                            min(ALIGN_SPEED, -offset_y * PX_SCALE_Y))
         else:
-            log.info("  Banner NOT DETECTED during descent (may fill frame) — holding lateral, continuing down")
+            log.info("  Banner NOT DETECTED during descent — holding lateral, continuing down")
+            draw_debug(frame, None, label=f"DESCEND no-detect | alt={alt:.2f}m")
             vforward = 0.0
             vright   = 0.0
 
