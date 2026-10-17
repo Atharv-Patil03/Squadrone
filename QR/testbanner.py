@@ -39,7 +39,7 @@ from pymavlink import mavutil
 # DEBUG_SAVE_DIR: saves an annotated JPEG every DEBUG_SAVE_INTERVAL frames
 #   → view on laptop:  scp pi@<PI_IP>:~/squadrone/debug_frame.jpg .
 #   or watch live:     watch -n1 'scp pi@<PI_IP>:~/squadrone/debug_frame.jpg . && eog debug_frame.jpg'
-SHOW_WINDOW          = True          # True = cv2 window (needs display)
+SHOW_WINDOW          = False          # True = cv2 window (needs display)
 DEBUG_SAVE_DIR       = os.path.expanduser("~/squadrone")
 DEBUG_SAVE_INTERVAL  = 5             # save every N frames
 _debug_frame_count   = 0
@@ -62,7 +62,7 @@ SERIAL_PORT = "/dev/ttyAMA0"
 BAUD_RATE   = 921600
 
 # Flight
-TAKEOFF_ALT_M     = 3.0    # cruise altitude for alignment
+TAKEOFF_ALT_M     = 5.0    # cruise altitude for alignment — higher so 5x5ft banner fits in frame
 TAKEOFF_THRESHOLD = 0.95   # fraction of target alt = takeoff done
 LAND_ALT_M        = 2.0    # descend to this before switching LAND mode
                            # Set above LAND_ALT_M ArduCopter param (your team set ~1.5m)
@@ -140,6 +140,15 @@ def start_camera():
     cam.configure(cfg)
     cam.start()
     time.sleep(2)
+
+    # Enable continuous autofocus on IMX519 (ArduCam)
+    try:
+        cam.set_controls({"AfMode": 2, "AfSpeed": 1})  # 2=Continuous, 1=Fast
+        log.info("Autofocus: continuous enabled")
+    except Exception as e:
+        log.warning(f"Autofocus not available: {e} — using fixed focus")
+
+    time.sleep(1)  # let AF settle
     log.info(f"ArduCam started (index {idx}, {CAM_WIDTH}x{CAM_HEIGHT})")
     return cam
 
@@ -299,10 +308,26 @@ def set_mode(mav, mode_name):
     return False
 
 def get_altitude(mav):
-    msg = mav.recv_match(type='GLOBAL_POSITION_INT', blocking=True, timeout=2)
-    if msg:
-        return msg.relative_alt / 1000.0
-    return 0.0
+    """
+    Return relative altitude in metres.
+    Flushes stale queued messages to get the freshest reading.
+    Returns None if no message arrives within timeout.
+    """
+    msg = None
+    # Drain any queued GLOBAL_POSITION_INT messages to get the latest
+    while True:
+        m = mav.recv_match(type='GLOBAL_POSITION_INT', blocking=False)
+        if m is None:
+            break
+        msg = m
+    # If nothing was queued, wait briefly for a fresh one
+    if msg is None:
+        msg = mav.recv_match(type='GLOBAL_POSITION_INT', blocking=True, timeout=2)
+    if msg is not None:
+        alt = msg.relative_alt / 1000.0
+        return alt
+    log.warning("get_altitude: no GLOBAL_POSITION_INT received!")
+    return None   # explicit None so callers can detect failure
 
 def send_velocity(mav, forward, right, down=0.0, duration_s=0.2):
     """Body-frame velocity — forward=nose, right=drone's right."""
@@ -344,7 +369,11 @@ def arm_and_takeoff(mav, target_alt_m):
     start = time.time()
     while time.time() - start < 30:
         alt = get_altitude(mav)
-        log.info(f"  Alt: {alt:.2f}m")
+        if alt is None:
+            log.warning("  Alt: no fix yet…")
+            time.sleep(0.5)
+            continue
+        log.info(f"  Alt: {alt:.2f}m  (target {threshold:.2f}m)")
         if alt >= threshold:
             log.info(f"Takeoff done at {alt:.2f}m")
             return True
@@ -488,6 +517,31 @@ def state_align_to_banner(mav, cam):
 # STATE: LAND ON BANNER
 # ──────────────────────────────────────────────────────────────────────────────
 
+def lock_yaw(mav):
+    """
+    Send a yaw command to hold current heading.
+    This prevents yaw drift during the descent phase.
+    """
+    # Get current yaw from ATTITUDE message
+    msg = mav.recv_match(type='ATTITUDE', blocking=True, timeout=2)
+    if msg is None:
+        log.warning("lock_yaw: no ATTITUDE message — skipping yaw lock")
+        return
+    import math
+    yaw_deg = math.degrees(msg.yaw) % 360
+    log.info(f"  Locking yaw at {yaw_deg:.1f}°")
+    mav.mav.command_long_send(
+        mav.target_system, mav.target_component,
+        mavutil.mavlink.MAV_CMD_CONDITION_YAW,
+        0,
+        yaw_deg,  # target angle degrees
+        10,       # yaw rate deg/s
+        1,        # direction: 1=CW
+        0,        # relative=0 (absolute heading)
+        0, 0, 0
+    )
+
+
 def state_land_on_banner(mav, cam):
     """
     Descend slowly to LAND_ALT_M while keeping banner centred,
@@ -500,37 +554,63 @@ def state_land_on_banner(mav, cam):
     log.info("\n── LAND ON BANNER ──")
     reset_detection_history()   # clear history from align phase
 
+    # Lock yaw so heading stays fixed during descent
+    lock_yaw(mav)
+
     cx_frame = CAM_WIDTH  // 2
     cy_frame = CAM_HEIGHT // 2
     PX_SCALE_X = ALIGN_SPEED / (CAM_WIDTH  / 2)
     PX_SCALE_Y = ALIGN_SPEED / (CAM_HEIGHT / 2)
 
     DESCEND_SPEED = 0.4   # m/s downward
+    descent_start = time.time()
+    DESCENT_TIMEOUT_S = 60
 
     while True:
-        alt = get_altitude(mav)
-        log.info(f"  Alt: {alt:.2f}m")
+        # Safety: overall descent timeout
+        if time.time() - descent_start > DESCENT_TIMEOUT_S:
+            log.warning(f"  Descent timeout ({DESCENT_TIMEOUT_S}s) — triggering LAND anyway")
+            stop_drone(mav)
+            time.sleep(0.3)
+            set_mode(mav, 'LAND')
+            return True
 
-        if alt <= LAND_ALT_M + 0.3:
-            log.info(f"  Reached {alt:.2f}m → switching to LAND")
+        alt = get_altitude(mav)
+        if alt is None:
+            log.warning("  Alt: no fix — skipping loop iteration")
+            time.sleep(0.2)
+            continue
+
+        log.info(f"  Alt: {alt:.2f}m  (LAND triggers at ≤{LAND_ALT_M:.1f}m)")
+
+        if alt <= LAND_ALT_M:
+            log.info(f"  ✓ Reached {alt:.2f}m → switching to LAND")
             stop_drone(mav)
             time.sleep(0.5)
-            set_mode(mav, 'LAND')
+            ok = set_mode(mav, 'LAND')
+            log.info(f"  LAND mode {'set ✓' if ok else 'NOT CONFIRMED — retrying'}")
+            if not ok:
+                # Retry once
+                time.sleep(0.5)
+                set_mode(mav, 'LAND')
+
             log.info("  LAND mode active — waiting for touchdown…")
             # Wait for disarm OR altitude near zero
-            start = time.time()
-            while time.time() - start < 45:
+            land_start = time.time()
+            while time.time() - land_start < 60:
                 if not mav.motors_armed():
                     log.info("  ✓ Landed and disarmed automatically")
                     return True
                 alt_now = get_altitude(mav)
+                if alt_now is None:
+                    alt_now = -1.0
                 log.info(f"  Landing… alt={alt_now:.2f}m  armed={mav.motors_armed()}")
                 if alt_now < 0.15:
                     log.info("  ✓ Altitude near zero — touchdown confirmed")
                     time.sleep(3)   # let ArduCopter disarm on its own
                     return True
                 time.sleep(1)
-            log.warning("  Land timeout (45s) — check drone manually")
+            log.warning("  Land timeout (60s) — check drone manually")
             return True
 
         # Capture frame and keep centred while descending
@@ -600,7 +680,12 @@ def main():
             set_mode(mav, 'RTL')
             return
 
-        time.sleep(1.0)   # stabilise
+        time.sleep(1.0)   # stabilise at cruise altitude
+
+        # Lock yaw immediately after takeoff so heading holds through alignment
+        log.info("  Locking yaw (hold current heading)…")
+        lock_yaw(mav)
+        time.sleep(0.5)
 
         # 3. Align to banner
         log.info("\n[4/4] Aligning to banner…")
