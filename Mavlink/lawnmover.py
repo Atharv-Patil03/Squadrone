@@ -145,24 +145,30 @@ class Drone:
             elif t == "STATUSTEXT":
                 print(f"  [FC] {msg.text}")
 
-    def wait_gps(self, timeout=120):
-        print("Waiting for GPS 3D fix…")
+    def wait_gps(self, timeout=300):
+        print("Waiting for GPS 3D fix… (press Ctrl+C to skip if FC already has position)")
         t0 = time.time()
+        last_print = 0
         while time.time()-t0 < timeout:
             self.update()
             try:
                 gps = self.master.recv_match(type="GPS_RAW_INT", blocking=False)
             except Exception:
                 gps = None
-            if gps and gps.fix_type >= 3 and self.lat is not None:
-                print(f"GPS ✓  {self.lat:.7f}, {self.lon:.7f}  "
-                      f"HDOP={gps.eph/100:.2f}")
-                return
             elapsed = int(time.time()-t0)
-            if elapsed % 5 == 0:
-                print(f"  waiting… {elapsed}s", end="\r")
+            if gps:
+                fix = gps.fix_type
+                sats = gps.satellites_visible
+                if elapsed - last_print >= 3:
+                    print(f"  fix={fix}  sats={sats}  "
+                          f"lat={self.lat}  {elapsed}s elapsed")
+                    last_print = elapsed
+                if fix >= 3 and self.lat is not None:
+                    print(f"GPS ✓  {self.lat:.7f}, {self.lon:.7f}  "
+                          f"HDOP={gps.eph/100:.2f}")
+                    return
             time.sleep(0.5)
-        raise RuntimeError("No GPS fix — check antenna")
+        raise RuntimeError("No GPS fix after 5 min — check antenna")
 
     def set_param(self, name, value):
         self.master.mav.param_set_send(
@@ -322,6 +328,8 @@ def main():
     print(f"Re-planned from drone pos — {len(path_xy)} WPs\n")
 
     drone.set_param("RTL_ALT", ALTITUDE_M * 100)
+
+    input("\n>>> Press ENTER to arm and takeoff (make sure area is clear!) <<<\n")
 
     pilot_took_over = False
     try:
