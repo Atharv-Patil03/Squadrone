@@ -1,44 +1,38 @@
+#!/usr/bin/env python3
 """
-SQUADRONE — Banner Land Test
+SQUADRONE — Banner Detect + Land Test  (v5)
 File: test_banner_land.py
 Team: Squadrone AT2026RC60, PVGCOET Pune, SAEINDIA AeroTHON 2026
 
-Test sequence:
-  1. Connect MAVLink
-  2. Arm & take off to TAKEOFF_ALT_M (5m)
-  3. Auto-calibrate banner colour from ground (works with ANY green shade)
-  4. Align downward ArduCam over green banner
-     - Lateral search (right/left/fwd/back) — NO YAW, nose toward corridor
-  5. Once centred → descend to LAND_ALT_M (2.0m) → LAND mode
+PURPOSE (TEST ONLY):
+  Takeoff → find green banner → align above it → LAND on it.
+  Landing = proof the detection and alignment worked.
+  In the real mission the drone will hover at 3 m instead of landing.
 
-Camera geometry (REAR-mounted, facing DOWN):
-  Drone NOSE  → BOTTOM of frame
+CAMERA GEOMETRY (rear-mounted downward):
+  Drone NOSE  → BOTTOM of frame  (+offset_y → banner ahead → move FORWARD)
   Drone TAIL  → TOP of frame
-  offset_y +ve → banner below centre → banner AHEAD  → move FORWARD
-  offset_y -ve → banner above centre → banner BEHIND → move BACKWARD
-  offset_x +ve → banner right of centre              → move RIGHT
+  +offset_x   → banner right      → move RIGHT
 
-BANNER vs GRASS/TREE rejection:
-  [G1] MIN_AREA = 2000        — banner is large from 5m; grass blobs are tiny
-  [G2] MIN_RECTANGULARITY=0.55 — banner is solid rect; grass/trees are irregular
-  [G3] MIN_SOLIDITY = 0.80    — banner fills its convex hull; foliage does not
-  [G4] Single dominant blob   — banner is ONE object; if largest < 3× second,
-                                 it is scattered grass, not a banner
-  [G5] Calibration locks on the LARGEST blob on ground — the banner itself
+RUN MODES:
+  python3 test_banner_land.py                 # normal flight
+  python3 test_banner_land.py --calibrate     # HSV probe loop, no flight
+  python3 test_banner_land.py --skip-calib    # skip auto-calibration step
+  python3 test_banner_land.py --check-only    # ground check, no flight
 
-All fixes:
-  [F1] get_altitude() drain loop
-  [F2] lock_yaw() — nose stays toward corridor
-  [F3] land state: None alt, retry, 60s timeout
-  [F4] +offset_y for forward/back
-  [F5] Relaxed HSV initially; tightened by calibration
-  [F6] Ground check + diagnostic images
-  [F7] --calibrate mode
-  [F8] Honest landing result
-  [F9] Immediate single-frame detection during descent
-  [F10] Auto colour calibration — works with any shade of green
-  [F11] Lateral search pattern, zero yaw
-  [G1-G5] Banner-vs-grass/tree rejection
+v5 fixes over v4:
+  [F1] LOSS_TIMEOUT_S bumped 0.6→1.5 — brief occlusions no longer break lock
+  [F2] DOMINANT_RATIO dropped 2.5→1.6 — banner passes even with nearby greenery
+  [F3] MIN_SOLIDITY dropped 0.80→0.70 — creased/folded banners still detected
+  [F4] Rolling window uses WEIGHTED average (recent frames count more)
+  [F5] Consecutive-detection streak tracked separately for robustness metric
+  [F6] send_velocity default dur bumped 0.25→0.35 s — command reaches FC reliably
+  [F7] Align loop sends explicit altitude hold every cycle (prevents drift)
+  [F8] Descent uses rolling window (not immediate) — one bad frame can't yank drone
+  [F9] All raw frames saved to ~/squadrone/frames/ during align (capped at 200)
+  [F10] Ground check saves HSV mask + annotated frame for easy debugging
+  [F11] Auto-calibration now triggered by ENTER prompt so user can point cam first
+  [F12] SEARCH_STEPS expanded to cover 4-metre radius before giving up
 """
 
 import cv2
@@ -53,111 +47,139 @@ from collections import deque
 from picamera2 import Picamera2
 from pymavlink import mavutil
 
-# ──────────────────────────────────────────────────────────────────────────────
-# DEBUG
-# ──────────────────────────────────────────────────────────────────────────────
-SHOW_WINDOW          = True
-DEBUG_SAVE_DIR       = os.path.expanduser("~/squadrone")
-DEBUG_SAVE_INTERVAL  = 5
-DEBUG_SAVE_NO_DETECT = True
-os.makedirs(DEBUG_SAVE_DIR, exist_ok=True)
-
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # LOGGING
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+
+DEBUG_DIR  = os.path.expanduser("~/squadrone")
+FRAME_DIR  = os.path.join(DEBUG_DIR, "frames")
+os.makedirs(FRAME_DIR, exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(os.path.join(DEBUG_DIR, "flight.log"), mode='a')
+    ]
 )
 log = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
-SERIAL_PORT = "/dev/ttyAMA0"
-BAUD_RATE   = 921600
+SERIAL_PORT     = "/dev/ttyAMA0"
+BAUD_RATE       = 921600
 
-TAKEOFF_ALT_M     = 5.0
-TAKEOFF_THRESHOLD = 0.95
-LAND_ALT_M        = 2.0   # must be > ArduCopter LAND_ALT_LOW_M (1.5m)
+TAKEOFF_ALT_M   = 5.0
+TAKEOFF_THRESH  = 0.95
+LAND_ALT_M      = 2.0          # trigger LAND mode once below this
 
-CAM_WIDTH     = 640
-CAM_HEIGHT    = 480
-ARDUCAM_INDEX = None      # None = auto-detect
+CAM_WIDTH       = 640
+CAM_HEIGHT      = 480
 
-# ── HSV — broad initial range, overwritten by calibration ────────────────────
-LOWER_GREEN = np.array([25, 40, 40])
-UPPER_GREEN = np.array([95, 255, 255])
+# ── HSV — from bannerdetect.py (team-confirmed) ───────────────────────────
+LOWER_GREEN = np.array([35,  80,  50])
+UPPER_GREEN = np.array([85, 255, 255])
 
-MORPH_KERNEL_SIZE = 5
+MORPH_K     = 5
 
-# ── [G1-G4] Banner-vs-grass/tree shape filters ───────────────────────────────
-#
-#  From 5m altitude a 5×5 ft (1.5×1.5 m) banner covers roughly:
-#    pixel_size ≈ (1.5 / 5.0) × (480 / VFOV_rad)
-#  Conservatively: ~80×80 px = 6400 px² minimum expected area.
-#  We use 2000 as the floor to handle partial views and oblique angles.
-#
-MIN_AREA           = 2000   # [G1] px² — rejects small grass blobs
-MIN_ASPECT_RATIO   = 0.3    # banner is squarish (5×5 ft) — reject thin slivers
-MAX_ASPECT_RATIO   = 3.5    # some tilt gives slight elongation — still limit
-MIN_RECTANGULARITY = 0.55   # [G2] area / bounding-box — banner ≈0.7, grass ≈0.1
-MIN_SOLIDITY       = 0.80   # [G3] area / convexHull area — banner≈0.9, foliage≈0.4
-DOMINANT_RATIO     = 3.0    # [G4] largest must be ≥ this × second largest
+# ── Shape filters ─────────────────────────────────────────────────────────
+MIN_AREA           = 400    # [G1] slightly lower for 5 m altitude
+MIN_ASPECT_RATIO   = 0.25   # banner can look nearly square from directly above
+MAX_ASPECT_RATIO   = 4.0
+MIN_RECTANGULARITY = 0.30   # [G2] relaxed — banner may be partially occluded
+MIN_SOLIDITY       = 0.70   # [G3] FIX [F3] — creased banner still passes
+DOMINANT_RATIO     = 1.6    # [G4] FIX [F2] — allow nearby greenery
 
-# ── Alignment ────────────────────────────────────────────────────────────────
-ALIGN_THRESHOLD_PX  = 50
-ALIGN_HOLD_FRAMES   = 5
-ALIGN_TIMEOUT_S     = 90
-ALIGN_SPEED         = 0.4
-MIN_MOVE_SPEED      = 0.15
+# ── Rolling window ────────────────────────────────────────────────────────
+HISTORY_LENGTH       = 10
+REQUIRED_DETECTIONS  = 6    # needs 6/10 — slightly easier than v4's 5/8
+LOSS_TIMEOUT_S       = 1.5  # FIX [F1] — 1.5 s gap before detection resets
 
-HISTORY_LENGTH      = 8
-REQUIRED_DETECTIONS = 5
+# ── Alignment ─────────────────────────────────────────────────────────────
+ALIGN_THRESHOLD_PX   = 40   # ≈0.4 m real-world error at 5 m altitude
+ALIGN_HOLD_FRAMES    = 6    # 6 consecutive centred frames (reduced — drift makes 8 nearly impossible)
+ALIGN_TIMEOUT_S      = 150
 
-# ── Search pattern (lateral only, zero yaw) ──────────────────────────────────
-SEARCH_TRIGGER_FRAMES = 15  # no-detect frames before search kicks in
+# Two-zone speed control — far: push hard enough to overcome drift; close: fine tune
+# Zone boundary: pixels from centre
+ALIGN_ZONE_FAR_PX    = 80   # > this → use FAR speed (decisive move)
+ALIGN_SPEED_FAR      = 0.55 # m/s when far off-centre — cuts through drift
+ALIGN_SPEED_NEAR     = 0.20 # m/s when close (< FAR_PX) — fine correction
+MIN_ALIGN_SPEED      = 0.15 # absolute floor — below this a command does nothing at 5 m
 
-# (forward m/s, right m/s, duration s)
+# Legacy names kept for search/land sections
+MAX_ALIGN_SPEED      = ALIGN_SPEED_FAR
+
+# ── Search ────────────────────────────────────────────────────────────────
+SEARCH_TRIGGER_FRAMES = 15  # wait longer before triggering search step
+
+# FIX [F12]: Expanded search covers ~4m radius spiral
+# Each tuple: (forward_mps, right_mps, duration_s)
 SEARCH_STEPS = [
-    ( 0.0,  0.35, 1.2),   # slide right
-    ( 0.0, -0.35, 2.4),   # slide left (crosses centre + overshoot)
-    ( 0.0,  0.35, 1.2),   # back to centre
-    ( 0.25, 0.0,  1.0),   # step forward
-    ( 0.0,  0.45, 1.5),   # wider right
-    ( 0.0, -0.45, 3.0),   # wider left
-    ( 0.0,  0.45, 1.5),   # back to centre
-    (-0.25, 0.0,  1.0),   # step back
-    ( 0.0,  0.0,  1.0),   # pause — recheck
+    # small initial sweep to find banner if just off-centre
+    ( 0.0,  0.30, 1.2),
+    ( 0.0, -0.30, 2.4),
+    ( 0.0,  0.30, 1.2),
+    ( 0.30, 0.0,  1.0),
+    # wider sweep — 1 m radius
+    ( 0.0,  0.50, 1.5),
+    ( 0.0, -0.50, 3.0),
+    ( 0.0,  0.50, 1.5),
+    (-0.30, 0.0,  1.0),
+    # even wider — 2 m radius
+    ( 0.0,  0.60, 2.0),
+    ( 0.0, -0.60, 4.0),
+    ( 0.0,  0.60, 2.0),
+    ( 0.40, 0.0,  1.5),
+    ( 0.0,  0.60, 2.0),
+    ( 0.0, -0.60, 4.0),
+    ( 0.0,  0.60, 2.0),
+    (-0.40, 0.0,  1.5),
+    # return to start
+    ( 0.0,  0.0,  1.0),
 ]
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# HEADING STATE  (body → NED — stops yaw-induced drift)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_heading_rad = 0.0
+
+
+def capture_heading(mav):
+    global _heading_rad
+    msg = mav.recv_match(type='ATTITUDE', blocking=True, timeout=3)
+    if msg is None:
+        log.warning("capture_heading: no ATTITUDE — using 0°")
+        return
+    _heading_rad = msg.yaw
+    log.info(f"  Heading locked: {math.degrees(msg.yaw):.1f}°")
+
+
+def body_to_ned(fwd, rgt):
+    h = _heading_rad
+    north = fwd * math.cos(h) - rgt * math.sin(h)
+    east  = fwd * math.sin(h) + rgt * math.cos(h)
+    return north, east
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CAMERA
-# ──────────────────────────────────────────────────────────────────────────────
-
-def resolve_arducam_index():
-    if ARDUCAM_INDEX is not None:
-        return ARDUCAM_INDEX
-    try:
-        cameras = Picamera2.global_camera_info()
-        log.info("Cameras: %s",
-                 [(c.get("Num"), c.get("Model")) for c in cameras])
-        for c in cameras:
-            model = str(c.get("Model", "")).lower()
-            if "imx519" in model or "arducam" in model:
-                idx = c.get("Num", 1)
-                log.info(f"ArduCam auto-detected at index {idx} ({model})")
-                return idx
-        log.warning("ArduCam not found by name — defaulting to index 1")
-        return 1
-    except Exception as e:
-        log.warning(f"Camera info failed: {e} — defaulting to 1")
-        return 1
-
+# ─────────────────────────────────────────────────────────────────────────────
 
 def start_camera():
-    idx = resolve_arducam_index()
+    idx = 1
+    try:
+        info = Picamera2.global_camera_info()
+        for c in info:
+            if "imx519" in str(c.get("Model", "")).lower():
+                idx = c.get("Num", 1)
+                log.info(f"IMX519 detected at index {idx}")
+                break
+    except Exception:
+        pass
     cam = Picamera2(idx)
     cfg = cam.create_preview_configuration(
         main={"size": (CAM_WIDTH, CAM_HEIGHT), "format": "RGB888"},
@@ -168,395 +190,285 @@ def start_camera():
     time.sleep(2)
     try:
         cam.set_controls({"AfMode": 2, "AfSpeed": 1})
-        log.info("Autofocus: continuous enabled")
-    except Exception as e:
-        log.warning(f"Autofocus not available: {e}")
-    time.sleep(1)
-    log.info(f"ArduCam started (index {idx}, {CAM_WIDTH}x{CAM_HEIGHT})")
+    except Exception:
+        pass
+    log.info(f"Camera started ({CAM_WIDTH}×{CAM_HEIGHT})")
     return cam
 
-# ──────────────────────────────────────────────────────────────────────────────
-# [F10] AUTO COLOUR CALIBRATION
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTO COLOUR CALIBRATION  [F11] — user points cam at banner first
+# ─────────────────────────────────────────────────────────────────────────────
 
-def calibrate_banner_colour(cam, n_frames=20):
+def calibrate_banner_colour(cam, n_frames=25):
     """
-    [F10][G5] Sample n_frames on the ground with banner in view.
-    Finds the LARGEST single green blob (= the banner, not grass).
-    Measures its exact H distribution and builds a tight range.
-    Updates global LOWER_GREEN / UPPER_GREEN.
+    Samples n_frames with banner in view.
+    Measures dominant hue + saturation → refines HSV range.
+    Falls back to defaults on too few samples.
     """
     global LOWER_GREEN, UPPER_GREEN
 
-    log.info("  Sampling banner colour (point camera at banner)…")
-    h_vals = []
-    s_vals = []
-
-    broad_lower = np.array([20, 30, 30])
-    broad_upper = np.array([100, 255, 255])
-    kernel = np.ones((5, 5), np.uint8)
+    log.info("  Sampling banner colour…")
+    broad_lo = np.array([20, 30, 30])
+    broad_hi = np.array([100, 255, 255])
+    kernel   = np.ones((5, 5), np.uint8)
+    h_vals   = []
+    s_vals   = []
+    v_vals   = []
 
     for _ in range(n_frames):
         rgb   = cam.capture_array()
         frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
         hsv   = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
-        mask = cv2.inRange(hsv, broad_lower, broad_upper)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-        contours, _ = cv2.findContours(
+        mask  = cv2.morphologyEx(
+            cv2.inRange(hsv, broad_lo, broad_hi),
+            cv2.MORPH_OPEN, kernel)
+        cnts, _ = cv2.findContours(
             mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
+        if not cnts:
             continue
-
-        # [G5] Use ONLY the largest blob — that is the banner
-        largest = max(contours, key=cv2.contourArea)
-        if cv2.contourArea(largest) < 100:
+        biggest = max(cnts, key=cv2.contourArea)
+        if cv2.contourArea(biggest) < 300:
             continue
-
-        # Sample H and S from the largest blob only
-        blob_mask = np.zeros(mask.shape, dtype=np.uint8)
-        cv2.drawContours(blob_mask, [largest], -1, 255, -1)
-
-        h_vals.extend(hsv[:, :, 0][blob_mask == 255].tolist())
-        s_vals.extend(hsv[:, :, 1][blob_mask == 255].tolist())
+        bm = np.zeros(mask.shape, np.uint8)
+        cv2.drawContours(bm, [biggest], -1, 255, -1)
+        h_vals.extend(hsv[:, :, 0][bm == 255].tolist())
+        s_vals.extend(hsv[:, :, 1][bm == 255].tolist())
+        v_vals.extend(hsv[:, :, 2][bm == 255].tolist())
         time.sleep(0.05)
 
-    if len(h_vals) < 30:
-        log.warning("  Not enough colour samples — using defaults")
-        log.warning("  Ensure banner is visible to camera during calibration")
-        return LOWER_GREEN, UPPER_GREEN
+    if len(h_vals) < 50:
+        log.warning(f"  Too few samples ({len(h_vals)}) — keeping defaults "
+                    f"{LOWER_GREEN}→{UPPER_GREEN}")
+        return
 
-    h_arr = np.array(h_vals)
-    s_arr = np.array(s_vals)
+    h_med   = int(np.median(h_vals))
+    h_std   = int(np.std(h_vals))
+    s_p10   = int(np.percentile(s_vals, 10))
+    v_p10   = int(np.percentile(v_vals, 10))
+    margin  = max(14, h_std + 8)
 
-    h_med  = int(np.median(h_arr))
-    s_p10  = int(np.percentile(s_arr, 10))
-    h_std  = int(np.std(h_arr))
-    margin = max(14, h_std + 8)
+    LOWER_GREEN[:] = [max(0,   h_med - margin),
+                      max(40,  s_p10 - 20),
+                      max(30,  v_p10 - 20)]
+    UPPER_GREEN[:] = [min(179, h_med + margin), 255, 255]
 
-    lower = np.array([max(0,   h_med - margin),
-                      max(30,  s_p10  - 20),
-                      30])
-    upper = np.array([min(179, h_med + margin),
-                      255, 255])
+    log.info(f"  ✓ Calibrated HSV: LOWER={LOWER_GREEN}  UPPER={UPPER_GREEN}  "
+             f"(h_med={h_med} margin=±{margin})")
+    cv2.imwrite(os.path.join(DEBUG_DIR, "cal_frame.jpg"),
+                cv2.cvtColor(cam.capture_array(), cv2.COLOR_RGB2BGR))
 
-    log.info(f"  ✓ H_median={h_med}  H_std={h_std}  margin=±{margin}")
-    log.info(f"  ✓ LOWER_GREEN = {lower}")
-    log.info(f"  ✓ UPPER_GREEN = {upper}")
+# ─────────────────────────────────────────────────────────────────────────────
+# BANNER DETECTION
+# ─────────────────────────────────────────────────────────────────────────────
 
-    # Save calibration diagnostic
-    rgb   = cam.capture_array()
-    frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-    hsv_f = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    cal_mask = cv2.inRange(hsv_f, lower, upper)
-    cv2.imwrite(os.path.join(DEBUG_SAVE_DIR, "cal_frame.jpg"), frame)
-    cv2.imwrite(os.path.join(DEBUG_SAVE_DIR, "cal_mask.jpg"),
-                cv2.cvtColor(cal_mask, cv2.COLOR_GRAY2BGR))
-    log.info(f"  cal_frame.jpg + cal_mask.jpg → {DEBUG_SAVE_DIR}/")
-
-    LOWER_GREEN = lower
-    UPPER_GREEN = upper
-    return lower, upper
-
-# ──────────────────────────────────────────────────────────────────────────────
-# BANNER DETECTION  [G1-G4 filters inside]
-# ──────────────────────────────────────────────────────────────────────────────
-
-_kernel      = np.ones((MORPH_KERNEL_SIZE, MORPH_KERNEL_SIZE), np.uint8)
-_det_history = deque(maxlen=HISTORY_LENGTH)
+_kernel        = np.ones((MORPH_K, MORPH_K), np.uint8)
+_history       = deque(maxlen=HISTORY_LENGTH)
+_last_seen_t   = 0.0
+_streak        = 0          # consecutive detection frames (for logging)
 
 
-def _find_banner_raw(frame):
+def _detect_raw(frame):
     """
-    Single-frame detection with full grass/tree rejection.
-
-    Returns dict with center, area, green_px — or None.
-
-    Rejection pipeline:
-      HSV mask → morphology → find contours
-      For each contour:
-        [G1] area >= MIN_AREA
-        [G2] rectangularity >= MIN_RECTANGULARITY
-        [G3] solidity >= MIN_SOLIDITY
-             (cv2.convexHull area vs contour area)
-      Keep candidates, sort by area descending.
-      [G4] If top-2 exist: largest must be >= DOMINANT_RATIO × second
-           (rejects scattered grass even if individually large enough)
-      Return largest surviving candidate.
+    Single-frame detection.
+    Returns best-candidate dict or None.
+    Filters: [G1] area, [G2] rectangularity, [G3] solidity, [G4] dominant blob.
     """
     hsv  = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, LOWER_GREEN, UPPER_GREEN)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  _kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, _kernel)
 
-    green_px = cv2.countNonZero(mask)
-
-    contours, _ = cv2.findContours(
+    cnts, _ = cv2.findContours(
         mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     candidates = []
-
-    for c in contours:
+    for c in cnts:
         area = cv2.contourArea(c)
-        if area < MIN_AREA:                         # [G1]
+        if area < MIN_AREA:                          # [G1]
             continue
-
         x, y, w, h = cv2.boundingRect(c)
         if w == 0 or h == 0:
             continue
-
-        ar   = w / h
+        ar = w / h
         if not (MIN_ASPECT_RATIO <= ar <= MAX_ASPECT_RATIO):
             continue
-
-        rect = area / (w * h)
-        if rect < MIN_RECTANGULARITY:               # [G2]
+        rect_ratio = area / (w * h)
+        if rect_ratio < MIN_RECTANGULARITY:          # [G2]
             continue
-
         hull      = cv2.convexHull(c)
         hull_area = cv2.contourArea(hull)
         if hull_area == 0:
             continue
         solidity = area / hull_area
-        if solidity < MIN_SOLIDITY:                 # [G3]
+        if solidity < MIN_SOLIDITY:                  # [G3]
             continue
-
         M = cv2.moments(c)
         if M["m00"] == 0:
             continue
-        cx_c = int(M["m10"] / M["m00"])
-        cy_c = int(M["m01"] / M["m00"])
-
+        cx = int(M["m10"] / M["m00"])
+        cy = int(M["m01"] / M["m00"])
         candidates.append({
-            "center":       (cx_c, cy_c),
-            "box":          (x, y, w, h),
-            "area":         area,
-            "solidity":     solidity,
-            "rectangularity": rect,
-            "green_px":     green_px,
+            "center": (cx, cy), "box": (x, y, w, h),
+            "area": area, "solidity": solidity,
+            "rectangularity": rect_ratio, "mask": mask
         })
 
     if not candidates:
         return None
 
-    # Sort largest first
     candidates.sort(key=lambda d: d["area"], reverse=True)
 
-    # [G4] Dominant blob check — reject scattered grass
+    # [G4] Dominant blob check — relaxed ratio
     if len(candidates) >= 2:
-        if candidates[0]["area"] < DOMINANT_RATIO * candidates[1]["area"]:
-            # Two similarly-sized blobs → likely grass patches, not a banner
-            log.debug(f"  [G4] rejected: areas {candidates[0]['area']:.0f} "
-                      f"vs {candidates[1]['area']:.0f} — looks like grass")
+        ratio = candidates[0]["area"] / candidates[1]["area"]
+        if ratio < DOMINANT_RATIO:
+            log.debug(f"  [G4] rejected: ratio={ratio:.2f} < {DOMINANT_RATIO} "
+                      f"({candidates[0]['area']:.0f} vs {candidates[1]['area']:.0f})")
             return None
 
-    best = candidates[0]
-    log.debug(f"  [detect] area={best['area']:.0f} "
-              f"rect={best['rectangularity']:.2f} "
-              f"solid={best['solidity']:.2f} "
-              f"gpx={green_px}")
-    return best
+    return candidates[0]
 
 
-def detect_banner_rolling(frame):
-    """Rolling window — used during alignment for stability."""
-    raw = _find_banner_raw(frame)
-    _det_history.append(raw)
-    detections = [d for d in _det_history if d is not None]
+def detect_rolling(frame):
+    """
+    [F4] WEIGHTED rolling window — recent frames count more.
+    [F5] Tracks consecutive-detection streak.
+    [F1] LOSS_TIMEOUT_S = 1.5 s before resetting.
+    Returns averaged detection dict or None.
+    """
+    global _last_seen_t, _streak
+    raw = _detect_raw(frame)
+    _history.append(raw)
+    now = time.monotonic()
+    if raw is not None:
+        _last_seen_t = now
+        _streak += 1
+    else:
+        _streak = 0
+
+    if now - _last_seen_t > LOSS_TIMEOUT_S:
+        return None
+
+    detections = [d for d in _history if d is not None]
     if len(detections) < REQUIRED_DETECTIONS:
         return None
-    cx   = int(sum(d["center"][0] for d in detections) / len(detections))
-    cy   = int(sum(d["center"][1] for d in detections) / len(detections))
-    area = sum(d["area"]           for d in detections) / len(detections)
-    gp   = detections[-1].get("green_px", 0)
-    return {"center": (cx, cy), "area": area, "green_px": gp}
+
+    # Weighted average — most recent detection has weight HISTORY_LENGTH,
+    # oldest has weight 1.  Indices in detections[] are oldest→newest.
+    weights = [float(i + 1) for i in range(len(detections))]
+    total_w = sum(weights)
+    cx   = int(sum(w * d["center"][0] for w, d in zip(weights, detections)) / total_w)
+    cy   = int(sum(w * d["center"][1] for w, d in zip(weights, detections)) / total_w)
+    area = sum(w * d["area"]          for w, d in zip(weights, detections)) / total_w
+    return {
+        "center": (cx, cy),
+        "area":   area,
+        "box":    detections[-1]["box"],
+        "rectangularity": detections[-1]["rectangularity"],
+        "solidity":       detections[-1]["solidity"],
+        "streak":         _streak,
+    }
 
 
-def detect_banner_immediate(frame):
-    """Single-frame — used during descent for fast corrections."""
-    return _find_banner_raw(frame)
+def detect_immediate(frame):
+    """Single-frame, no window — used only for landing correction."""
+    return _detect_raw(frame)
 
 
-def reset_detection_history():
-    _det_history.clear()
+def reset_history():
+    global _last_seen_t, _streak
+    _history.clear()
+    _last_seen_t = 0.0
+    _streak      = 0
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DEBUG SAVE  [F9] — save all frames during align, capped at 200
+# ─────────────────────────────────────────────────────────────────────────────
+
+_save_n        = 0
+_frame_save_n  = 0
+_MAX_FRAMES    = 200
 
 
-def get_green_px(frame):
-    hsv  = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, LOWER_GREEN, UPPER_GREEN)
-    return cv2.countNonZero(mask)
+def save_debug(frame, banner, label="", force=False, save_frame=False):
+    global _save_n, _frame_save_n
+    _save_n += 1
 
-# ──────────────────────────────────────────────────────────────────────────────
-# DEBUG OVERLAY
-# ──────────────────────────────────────────────────────────────────────────────
-
-_dbg_count     = 0
-_dbg_last_save = 0
-
-
-def draw_debug(frame, banner, offset_x=None, offset_y=None,
-               label="", force_save=False):
-    global _dbg_count, _dbg_last_save
-    _dbg_count += 1
-
-    dbg  = frame.copy()
     cx_f = CAM_WIDTH  // 2
     cy_f = CAM_HEIGHT // 2
 
-    cv2.line(dbg, (cx_f - 30, cy_f), (cx_f + 30, cy_f), (0, 255, 255), 1)
-    cv2.line(dbg, (cx_f, cy_f - 30), (cx_f, cy_f + 30), (0, 255, 255), 1)
-    cv2.putText(dbg, "TOP=TAIL", (5, 14),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1)
-    cv2.putText(dbg, "BOT=NOSE", (5, CAM_HEIGHT - 4),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1)
+    dbg = frame.copy()
+    cv2.line(dbg, (cx_f-30, cy_f), (cx_f+30, cy_f), (0, 255, 255), 1)
+    cv2.line(dbg, (cx_f, cy_f-30), (cx_f, cy_f+30), (0, 255, 255), 1)
+    cv2.putText(dbg, "BOT=NOSE", (5, CAM_HEIGHT-5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 150, 150), 1)
 
-    if banner is not None:
+    if banner:
         cx, cy = banner["center"]
-        gp     = banner.get("green_px", "?")
-        sol    = banner.get("solidity", 0)
-        rect   = banner.get("rectangularity", 0)
-        cv2.circle(dbg, (cx, cy), 14, (0, 255, 0), 2)
+        x, y, w, h = banner.get("box", (0, 0, 0, 0))
+        cv2.rectangle(dbg, (x, y), (x+w, y+h), (0, 255, 0), 2)
+        cv2.circle(dbg,   (cx, cy), 8, (0, 255, 0), 2)
         cv2.line(dbg, (cx_f, cy_f), (cx, cy), (0, 200, 0), 1)
-        if offset_x is not None:
-            t1 = (f"off:({offset_x:+d},{offset_y:+d}) "
-                  f"area:{int(banner['area'])}")
-            t2 = f"solid:{sol:.2f} rect:{rect:.2f} gpx:{gp}"
-            cv2.putText(dbg, t1, (10, 28),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 0), 2)
-            cv2.putText(dbg, t2, (10, 50),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 0), 1)
+        streak = banner.get("streak", 0)
+        cv2.putText(dbg,
+            f"off({cx-cx_f:+d},{cy-cy_f:+d}) "
+            f"area={int(banner['area'])} "
+            f"sol={banner.get('solidity',0):.2f} "
+            f"str={streak}",
+            (8, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 2)
     else:
-        cv2.putText(dbg, "NO BANNER", (10, 30),
+        cv2.putText(dbg, "NO BANNER", (8, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
     if label:
-        cv2.putText(dbg, label, (10, CAM_HEIGHT - 16),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 0), 2)
+        cv2.putText(dbg, label, (8, CAM_HEIGHT-16),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 255, 0), 1)
 
-    should_save = (
-        force_save
-        or (_dbg_count % DEBUG_SAVE_INTERVAL == 0)
-        or (DEBUG_SAVE_NO_DETECT
-            and banner is None
-            and _dbg_count != _dbg_last_save)
-    )
-    if should_save:
-        _dbg_last_save = _dbg_count
-        cv2.imwrite(os.path.join(DEBUG_SAVE_DIR, "debug_frame.jpg"), dbg)
+    # Always update the live debug frame
+    cv2.imwrite(os.path.join(DEBUG_DIR, "debug_frame.jpg"), dbg)
 
-    if SHOW_WINDOW:
-        cv2.imshow("Squadrone", dbg)
-        cv2.waitKey(1)
+    # [F9] Save individual frames during align phase
+    if save_frame and _frame_save_n < _MAX_FRAMES:
+        fn = os.path.join(FRAME_DIR, f"f{_frame_save_n:04d}.jpg")
+        cv2.imwrite(fn, dbg)
+        _frame_save_n += 1
 
-# ──────────────────────────────────────────────────────────────────────────────
-# [F7] HSV CALIBRATION MODE  — python3 test_banner_land.py --calibrate
-# ──────────────────────────────────────────────────────────────────────────────
-
-def run_hsv_calibration(cam):
-    log.info("=" * 60)
-    log.info("HSV CALIBRATION — point camera at green banner")
-    log.info(f"Output → {DEBUG_SAVE_DIR}/   |   Ctrl+C to stop")
-    log.info("=" * 60)
-
-    roi    = 100
-    cx     = CAM_WIDTH  // 2
-    cy     = CAM_HEIGHT // 2
-    kernel = np.ones((5, 5), np.uint8)
-
-    try:
-        while True:
-            rgb   = cam.capture_array()
-            frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-            hsv   = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
-            broad = cv2.inRange(hsv,
-                                np.array([20, 30, 30]),
-                                np.array([100, 255, 255]))
-            broad = cv2.morphologyEx(broad, cv2.MORPH_OPEN, kernel)
-            gp_b  = cv2.countNonZero(broad)
-
-            tuned = cv2.inRange(hsv, LOWER_GREEN, UPPER_GREEN)
-            gp_t  = cv2.countNonZero(tuned)
-
-            r    = hsv[cy-roi//2:cy+roi//2, cx-roi//2:cx+roi//2]
-            hm   = r[:,:,0].mean()
-            hmin = r[:,:,0].min()
-            hmax = r[:,:,0].max()
-            sm   = r[:,:,1].mean()
-            vm   = r[:,:,2].mean()
-
-            diag = frame.copy()
-            cv2.rectangle(diag,
-                          (cx-roi//2, cy-roi//2),
-                          (cx+roi//2, cy+roi//2),
-                          (0, 255, 255), 2)
-            lines = [
-                f"Centre H: {hmin:.0f}-{hmax:.0f}  mean={hm:.1f}",
-                f"Centre S: mean={sm:.1f}",
-                f"Centre V: mean={vm:.1f}",
-                f"Broad green px: {gp_b}",
-                f"Tuned green px: {gp_t}",
-                f"Suggested LOWER: [{max(0,int(hm)-14)}, "
-                f"{max(30,int(sm)-20)}, 30]",
-                f"Suggested UPPER: [{min(179,int(hm)+14)}, 255, 255]",
-            ]
-            for i, t in enumerate(lines):
-                cv2.putText(diag, t, (10, 24 + i * 22),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-            cv2.imwrite(os.path.join(DEBUG_SAVE_DIR, "hsv_frame.jpg"),       diag)
-            cv2.imwrite(os.path.join(DEBUG_SAVE_DIR, "hsv_mask_broad.jpg"),
-                        cv2.cvtColor(broad, cv2.COLOR_GRAY2BGR))
-            cv2.imwrite(os.path.join(DEBUG_SAVE_DIR, "hsv_mask_tuned.jpg"),
-                        cv2.cvtColor(tuned, cv2.COLOR_GRAY2BGR))
-
-            log.info(f"H={hm:.0f}[{hmin:.0f}-{hmax:.0f}] "
-                     f"S={sm:.0f} V={vm:.0f} "
-                     f"broad_gpx={gp_b} tuned_gpx={gp_t}")
-            time.sleep(1.0)
-
-    except KeyboardInterrupt:
-        log.info("Calibration done.")
-
-# ──────────────────────────────────────────────────────────────────────────────
-# MAVLINK HELPERS
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# MAVLINK
+# ─────────────────────────────────────────────────────────────────────────────
 
 def connect_mavlink():
     log.info(f"Connecting {SERIAL_PORT} @ {BAUD_RATE}…")
     mav = mavutil.mavlink_connection(SERIAL_PORT, baud=BAUD_RATE)
-    for attempt in range(20):
+    for i in range(25):
         mav.wait_heartbeat(timeout=3)
         if mav.target_system != 0:
             break
-        log.info(f"  target_system=0 (attempt {attempt+1}/20)")
+        log.info(f"  target_system=0 ({i+1}/25)")
     else:
-        raise RuntimeError("target_system=0 after 20 attempts")
-    log.info(f"Heartbeat — sys={mav.target_system} comp={mav.target_component}")
+        raise RuntimeError("MAVLink: target_system=0 after 25 attempts")
+    log.info(f"Connected sys={mav.target_system} comp={mav.target_component}")
     return mav
 
 
-def set_mode(mav, mode_name):
-    mode_id = mav.mode_mapping()[mode_name]
+def set_mode(mav, mode):
+    mid = mav.mode_mapping()[mode]
     mav.mav.set_mode_send(
         mav.target_system,
         mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-        mode_id
-    )
-    start = time.time()
-    while time.time() - start < 5:
-        msg = mav.recv_match(type='HEARTBEAT', blocking=True, timeout=1)
-        if msg and msg.custom_mode == mode_id:
-            log.info(f"Mode: {mode_name}")
+        mid)
+    t0 = time.time()
+    while time.time() - t0 < 5:
+        m = mav.recv_match(type='HEARTBEAT', blocking=True, timeout=1)
+        if m and m.custom_mode == mid:
+            log.info(f"Mode → {mode}")
             return True
-    log.warning(f"Mode {mode_name} not confirmed")
+    log.warning(f"Mode {mode} not confirmed")
     return False
 
 
-def get_altitude(mav):
-    """[F1] Drain stale queue, return freshest altitude. None on failure."""
+def get_alt(mav):
+    """Drain queue, return latest relative altitude in metres."""
     msg = None
     while True:
         m = mav.recv_match(type='GLOBAL_POSITION_INT', blocking=False)
@@ -564,447 +476,568 @@ def get_altitude(mav):
             break
         msg = m
     if msg is None:
-        msg = mav.recv_match(type='GLOBAL_POSITION_INT', blocking=True, timeout=2)
-    if msg is not None:
-        return msg.relative_alt / 1000.0
-    log.warning("get_altitude: no GLOBAL_POSITION_INT!")
-    return None
+        msg = mav.recv_match(
+            type='GLOBAL_POSITION_INT', blocking=True, timeout=2)
+    return (msg.relative_alt / 1000.0) if msg else None
 
 
-def send_velocity(mav, forward, right, down=0.0, duration_s=0.2):
-    """Body-frame velocity. forward=nose, right=drone-right."""
-    end = time.time() + duration_s
-    while time.time() < end:
+def send_velocity(mav, fwd_body, rgt_body, down=0.0, dur=0.35):
+    """
+    [F6] dur default bumped to 0.35 s — command reliably reaches FC.
+    Sends repeated SET_POSITION_TARGET_LOCAL_NED for the duration.
+    """
+    north, east = body_to_ned(fwd_body, rgt_body)
+    t_end = time.time() + dur
+    while time.time() < t_end:
         mav.mav.set_position_target_local_ned_send(
             0,
             mav.target_system, mav.target_component,
-            mavutil.mavlink.MAV_FRAME_BODY_OFFSET_NED,
-            0b0000111111000111,
+            mavutil.mavlink.MAV_FRAME_LOCAL_NED,
+            0b0000111111000111,   # velocity only
             0, 0, 0,
-            forward, right, down,
+            north, east, down,
             0, 0, 0,
             0, 0
         )
         time.sleep(0.05)
 
 
-def stop_drone(mav):
-    send_velocity(mav, 0, 0, 0, duration_s=0.3)
+def stop_drone(mav, dur=0.5):
+    """Brake. Slightly longer than v4 for more reliable stop."""
+    send_velocity(mav, 0, 0, 0, dur=dur)
 
 
-def lock_yaw(mav):
-    """[F2] Lock current heading. Called after takeoff and never changed."""
-    msg = mav.recv_match(type='ATTITUDE', blocking=True, timeout=2)
-    if msg is None:
-        log.warning("lock_yaw: no ATTITUDE — skipping")
-        return
-    yaw_deg = math.degrees(msg.yaw) % 360
-    log.info(f"  Locking yaw at {yaw_deg:.1f}° (nose toward corridor)")
-    mav.mav.command_long_send(
-        mav.target_system, mav.target_component,
-        mavutil.mavlink.MAV_CMD_CONDITION_YAW,
+def hold_alt(mav, target_m):
+    """
+    [F7] Send explicit altitude hold to prevent slow descent during align.
+    Uses MAV_FRAME_GLOBAL_RELATIVE_ALT — position control only.
+    """
+    mav.mav.set_position_target_global_int_send(
         0,
-        yaw_deg, 10, 1, 0, 0, 0, 0
+        mav.target_system, mav.target_component,
+        mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+        0b0000111111111000,   # position XYZ only (use current lat/lon)
+        0, 0, int(target_m),
+        0, 0, 0,
+        0, 0, 0,
+        0, 0
     )
 
 
-def arm_and_takeoff(mav, target_alt_m):
+def lock_yaw(mav):
+    msg = mav.recv_match(type='ATTITUDE', blocking=True, timeout=2)
+    if msg is None:
+        return
+    yaw_deg = math.degrees(msg.yaw) % 360
+    mav.mav.command_long_send(
+        mav.target_system, mav.target_component,
+        mavutil.mavlink.MAV_CMD_CONDITION_YAW,
+        0, yaw_deg, 10, 1, 0, 0, 0, 0)
+    log.info(f"  Yaw locked @ {yaw_deg:.1f}°")
+
+
+def arm_and_takeoff(mav, target_m):
     set_mode(mav, 'GUIDED')
     log.info("Arming…")
     mav.arducopter_arm()
     mav.motors_armed_wait()
-    log.info("Armed")
-    log.info(f"Takeoff → {target_alt_m}m")
+    log.info("Armed ✓")
     mav.mav.command_long_send(
         mav.target_system, mav.target_component,
         mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
-        0, 0, 0, 0, 0, 0, 0, target_alt_m
-    )
-    threshold = target_alt_m * TAKEOFF_THRESHOLD
-    start = time.time()
-    while time.time() - start < 30:
-        alt = get_altitude(mav)
-        if alt is None:
-            time.sleep(0.5)
-            continue
-        log.info(f"  Alt: {alt:.2f}m / {threshold:.2f}m")
-        if alt >= threshold:
-            log.info(f"  Takeoff done at {alt:.2f}m")
-            return True
+        0, 0, 0, 0, 0, 0, 0, target_m)
+    thresh = target_m * TAKEOFF_THRESH
+    t0 = time.time()
+    while time.time() - t0 < 35:
+        alt = get_alt(mav)
+        if alt is not None:
+            log.info(f"  Alt: {alt:.2f}m / {thresh:.2f}m")
+            if alt >= thresh:
+                log.info("  Takeoff done ✓")
+                return True
         time.sleep(0.5)
-    log.warning("Takeoff timeout")
+    log.error("Takeoff timeout!")
     return False
 
-# ──────────────────────────────────────────────────────────────────────────────
-# [F6] PRE-FLIGHT GROUND CHECK
-# ──────────────────────────────────────────────────────────────────────────────
-
-def ground_check(cam):
-    log.info("\n── PRE-FLIGHT GROUND CHECK ──")
-    rgb   = cam.capture_array()
-    frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-    hsv   = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
-    broad = cv2.inRange(hsv, np.array([20,30,30]), np.array([100,255,255]))
-    tuned = cv2.inRange(hsv, LOWER_GREEN, UPPER_GREEN)
-    gp_b  = cv2.countNonZero(broad)
-    gp_t  = cv2.countNonZero(tuned)
-
-    cv2.imwrite(os.path.join(DEBUG_SAVE_DIR, "precheck_frame.jpg"), frame)
-    cv2.imwrite(os.path.join(DEBUG_SAVE_DIR, "precheck_mask.jpg"),
-                cv2.cvtColor(tuned, cv2.COLOR_GRAY2BGR))
-
-    log.info(f"  Broad green px: {gp_b}")
-    log.info(f"  Tuned green px: {gp_t}")
-
-    raw = _find_banner_raw(frame)
-    if raw:
-        log.info(f"  ✓ Banner detected: center={raw['center']} "
-                 f"area={raw['area']:.0f} "
-                 f"solid={raw['solidity']:.2f} "
-                 f"rect={raw['rectangularity']:.2f}")
-    elif gp_b < 200:
-        log.warning("  ⚠ Very few green pixels — camera not pointing at banner?")
-    elif gp_t < 50:
-        log.warning("  ⚠ Broad sees green but tuned does not — re-run calibration")
-    else:
-        log.warning("  ⚠ Green pixels OK but shape filters rejected all contours")
-        log.warning(f"  MIN_AREA={MIN_AREA} MIN_SOLIDITY={MIN_SOLIDITY} "
-                    f"MIN_RECTANGULARITY={MIN_RECTANGULARITY}")
-        log.warning("  Try lowering MIN_AREA if banner is far away")
-
-    log.info(f"  Saved → {DEBUG_SAVE_DIR}/precheck_*.jpg")
-    return gp_t
-
-# ──────────────────────────────────────────────────────────────────────────────
-# [F11] SEARCH PATTERN — lateral translation only, ZERO YAW
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# SEARCH PATTERN
+# ─────────────────────────────────────────────────────────────────────────────
 
 class BannerSearcher:
-    """
-    Executes SEARCH_STEPS one at a time.
-    Drone nose ALWAYS toward corridor — no yaw change ever.
-    Resets when banner is found.
-    """
     def __init__(self, mav):
-        self.mav   = mav
-        self.step  = 0
-        self.cycle = 0
+        self.mav  = mav
+        self.step = 0
 
     def execute_step(self):
         idx = self.step % len(SEARCH_STEPS)
         fwd, rgt, dur = SEARCH_STEPS[idx]
-        log.info(f"  [SEARCH step {idx}/{len(SEARCH_STEPS)-1}] "
-                 f"fwd={fwd:+.2f} right={rgt:+.2f} dur={dur:.1f}s  "
-                 f"(nose stays toward corridor)")
-        send_velocity(self.mav, fwd, rgt, duration_s=dur)
+        log.info(f"  [SEARCH {idx+1}/{len(SEARCH_STEPS)}] "
+                 f"fwd={fwd:+.2f} rgt={rgt:+.2f} dur={dur:.1f}s")
+        stop_drone(self.mav, 0.4)
+        send_velocity(self.mav, fwd, rgt, dur=dur)
+        stop_drone(self.mav, 0.4)
         self.step += 1
-        if self.step % len(SEARCH_STEPS) == 0:
-            self.cycle += 1
-            log.info(f"  [SEARCH] full cycle {self.cycle} done — repeating")
 
     def reset(self):
-        self.step  = 0
-        self.cycle = 0
+        self.step = 0
 
-# ──────────────────────────────────────────────────────────────────────────────
-# STATE: ALIGN TO BANNER
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# STATE 1: ALIGN ABOVE BANNER
+# ─────────────────────────────────────────────────────────────────────────────
 
-def state_align_to_banner(mav, cam):
-    log.info("\n── ALIGN TO BANNER ──")
-    log.info(f"  Threshold ±{ALIGN_THRESHOLD_PX}px  hold {ALIGN_HOLD_FRAMES} frames")
+def state_align(mav, cam):
+    log.info("\n── STATE: ALIGN ABOVE BANNER ──")
     set_mode(mav, 'GUIDED')
-    reset_detection_history()
+    reset_history()
 
-    cx_frame = CAM_WIDTH  // 2
-    cy_frame = CAM_HEIGHT // 2
-    PX_SCALE_X = ALIGN_SPEED / (CAM_WIDTH  / 2)
-    PX_SCALE_Y = ALIGN_SPEED / (CAM_HEIGHT / 2)
+    cx_f = CAM_WIDTH  // 2
+    cy_f = CAM_HEIGHT // 2
 
     searcher      = BannerSearcher(mav)
-    align_count   = 0
+    align_hold    = 0
     no_banner_ct  = 0
-    align_start   = time.time()
-    _last_gpx_log = 0
+    t_start       = time.time()
+    t_last_yaw    = time.time()
+    t_last_diag   = time.monotonic()
+    t_last_althold = time.time()
+    first_seen    = False
 
     while True:
-        elapsed = time.time() - align_start
+        elapsed = time.time() - t_start
         if elapsed > ALIGN_TIMEOUT_S:
-            log.warning(f"  Align timeout ({ALIGN_TIMEOUT_S}s) — descending anyway")
+            log.warning("  Align timeout — proceeding to land")
             return True
+
+        # Re-lock yaw every 15 s
+        if time.time() - t_last_yaw > 15:
+            lock_yaw(mav)
+            t_last_yaw = time.time()
+
+        # [F7] Altitude hold pulse every 2 s — prevents slow descent
+        if time.time() - t_last_althold > 2.0:
+            hold_alt(mav, TAKEOFF_ALT_M)
+            t_last_althold = time.time()
 
         rgb   = cam.capture_array()
         frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
-        # Periodic green-pixel diagnostic
-        now = time.time()
-        if now - _last_gpx_log > 3.0:
-            gp = get_green_px(frame)
-            log.info(f"  [diag] green_px={gp}  elapsed={elapsed:.0f}s  "
-                     f"(0 = HSV wrong, low = banner not in frame)")
-            _last_gpx_log = now
+        # Periodic diagnostic
+        now = time.monotonic()
+        if now - t_last_diag > 4.0:
+            hsv  = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            mask = cv2.inRange(hsv, LOWER_GREEN, UPPER_GREEN)
+            gp   = cv2.countNonZero(mask)
+            alt  = get_alt(mav)
+            alt_s = f"{alt:.2f}m" if alt else "?"
+            log.info(f"  [diag] gpx={gp}  alt={alt_s}  "
+                     f"streak={_streak}  elapsed={elapsed:.0f}s  "
+                     f"history={sum(1 for d in _history if d is not None)}"
+                     f"/{HISTORY_LENGTH}")
+            t_last_diag = now
 
-        banner = detect_banner_rolling(frame)
+        # First raw detection → stop lateral immediately to let rolling window fill
+        any_raw = _detect_raw(frame)
+        if any_raw and not first_seen:
+            first_seen = True
+            log.info("  ↓ Banner first seen — stopping to settle rolling window")
+            stop_drone(mav, dur=0.8)
+            reset_history()
 
-        # ── Banner not visible ─────────────────────────────────────────────
+        banner = detect_rolling(frame)
+        save_debug(frame, banner,
+                   label=f"ALIGN t={elapsed:.0f}s hold={align_hold}",
+                   save_frame=True)
+
+        # ── No confirmed detection ─────────────────────────────────────────
         if banner is None:
-            align_count   = 0
+            align_hold   = 0
             no_banner_ct += 1
-            gp = get_green_px(frame)
-            log.info(f"  NO BANNER (frame {no_banner_ct}) gpx={gp}")
-            draw_debug(frame, None,
-                       label=f"NO BANNER gpx={gp} t={elapsed:.0f}s")
+            first_seen   = False
+            stop_drone(mav, dur=0.15)   # hold position, resist wind
+
             if no_banner_ct >= SEARCH_TRIGGER_FRAMES:
                 no_banner_ct = 0
                 searcher.execute_step()
-            else:
-                stop_drone(mav)
+                reset_history()
             continue
 
-        # ── Banner found ───────────────────────────────────────────────────
+        # ── Banner confirmed ───────────────────────────────────────────────
         searcher.reset()
         no_banner_ct = 0
+        first_seen   = True
 
         cx, cy   = banner["center"]
-        offset_x = cx - cx_frame
-        offset_y = cy - cy_frame   # +ve = AHEAD = move FORWARD [F4]
+        offset_x = cx - cx_f    # + → right
+        offset_y = cy - cy_f    # + → forward
 
         aligned = (abs(offset_x) <= ALIGN_THRESHOLD_PX and
                    abs(offset_y) <= ALIGN_THRESHOLD_PX)
 
-        status = f"ALIGNED {align_count+1}/{ALIGN_HOLD_FRAMES}" if aligned else "correcting"
-        log.info(f"  Banner ({cx},{cy})  "
-                 f"off({offset_x:+d},{offset_y:+d})  "
-                 f"area={int(banner['area'])}  {status}")
-        draw_debug(frame, banner, offset_x, offset_y,
-                   label=f"ALIGN | {status}")
+        tag = f"HOLD {align_hold+1}/{ALIGN_HOLD_FRAMES}" if aligned else "correcting"
+        log.info(f"  ({cx},{cy}) off({offset_x:+d},{offset_y:+d}) "
+                 f"area={int(banner['area'])} "
+                 f"sol={banner['solidity']:.2f} "
+                 f"str={banner.get('streak',0)} [{tag}]")
 
         if aligned:
-            align_count += 1
-            stop_drone(mav)
-            if align_count >= ALIGN_HOLD_FRAMES:
-                log.info("  ✓ BANNER CENTRED AND STABLE")
+            align_hold += 1
+            stop_drone(mav, dur=0.25)
+            if align_hold >= ALIGN_HOLD_FRAMES:
+                log.info("  ✓ CENTRED OVER BANNER")
+                stop_drone(mav, dur=0.6)
                 return True
         else:
-            align_count = 0
-            # [F4] +offset_y = forward
-            raw_vx = +offset_y * PX_SCALE_Y
-            raw_vy =  offset_x * PX_SCALE_X
+            align_hold = 0
 
-            vforward = 0.0
-            if abs(raw_vx) > 0.01:
-                vforward = (max(MIN_MOVE_SPEED, abs(raw_vx))
-                            * (1 if raw_vx > 0 else -1))
-                vforward = max(-ALIGN_SPEED, min(ALIGN_SPEED, vforward))
+            # ── Two-zone proportional speed ──────────────────────────────
+            # Far zone (|offset| > ALIGN_ZONE_FAR_PX): decisive speed — overcomes drift
+            # Near zone: fine correction proportional to error
+            err_px = math.hypot(offset_x, offset_y)   # combined distance from centre
 
-            vright = 0.0
-            if abs(raw_vy) > 0.01:
-                vright = (max(MIN_MOVE_SPEED, abs(raw_vy))
-                          * (1 if raw_vy > 0 else -1))
-                vright = max(-ALIGN_SPEED, min(ALIGN_SPEED, vright))
+            if err_px > ALIGN_ZONE_FAR_PX:
+                # Far: proportional within far-speed cap, minimum enforced
+                scale = ALIGN_SPEED_FAR / err_px
+            else:
+                # Near: proportional within near-speed cap
+                scale = ALIGN_SPEED_NEAR / max(err_px, 1.0)
 
-            log.info(f"  Moving fwd={vforward:+.2f} right={vright:+.2f} m/s")
-            send_velocity(mav, vforward, vright, duration_s=0.3)
+            vf = offset_y * scale
+            vr = offset_x * scale
 
-# ──────────────────────────────────────────────────────────────────────────────
-# STATE: LAND ON BANNER
-# ──────────────────────────────────────────────────────────────────────────────
+            # Enforce minimum speed (below this nothing moves at 5 m)
+            if 0 < abs(vf) < MIN_ALIGN_SPEED:
+                vf = math.copysign(MIN_ALIGN_SPEED, vf)
+            if 0 < abs(vr) < MIN_ALIGN_SPEED:
+                vr = math.copysign(MIN_ALIGN_SPEED, vr)
 
-def state_land_on_banner(mav, cam):
-    log.info("\n── LAND ON BANNER ──")
-    reset_detection_history()
-    lock_yaw(mav)
+            # Hard cap (safety)
+            vf = max(-ALIGN_SPEED_FAR, min(ALIGN_SPEED_FAR, vf))
+            vr = max(-ALIGN_SPEED_FAR, min(ALIGN_SPEED_FAR, vr))
 
-    cx_frame = CAM_WIDTH  // 2
-    cy_frame = CAM_HEIGHT // 2
-    PX_SCALE_X = ALIGN_SPEED / (CAM_WIDTH  / 2)
-    PX_SCALE_Y = ALIGN_SPEED / (CAM_HEIGHT / 2)
+            zone = "FAR" if err_px > ALIGN_ZONE_FAR_PX else "NEAR"
+            log.info(f"  [{zone} err={err_px:.0f}px] → fwd={vf:+.2f} rgt={vr:+.2f} m/s")
 
-    DESCEND_SPEED     = 0.4
-    DESCENT_TIMEOUT_S = 60
-    descent_start     = time.time()
-    banner_seen       = False   # [F8]
+            # Far zone: longer command burst — don't stop mid-move
+            dur = 0.50 if err_px > ALIGN_ZONE_FAR_PX else 0.35
+            send_velocity(mav, vf, vr, dur=dur)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STATE 2: DESCEND AND LAND
+# ─────────────────────────────────────────────────────────────────────────────
+
+# [F8] Descent uses a short rolling window (5-frame) rather than single frame
+_desc_history = deque(maxlen=5)
+_desc_last_t  = 0.0
+
+
+def _detect_descent(frame):
+    """5-frame rolling window for descent correction — smoother than immediate."""
+    global _desc_last_t
+    raw = _detect_raw(frame)
+    _desc_history.append(raw)
+    now = time.monotonic()
+    if raw is not None:
+        _desc_last_t = now
+    if now - _desc_last_t > 0.8:       # shorter loss timeout during descent
+        return None
+    dets = [d for d in _desc_history if d is not None]
+    if len(dets) < 2:
+        return None
+    cx = int(sum(d["center"][0] for d in dets) / len(dets))
+    cy = int(sum(d["center"][1] for d in dets) / len(dets))
+    return {"center": (cx, cy), "area": dets[-1]["area"],
+            "box": dets[-1]["box"],
+            "solidity": dets[-1]["solidity"],
+            "rectangularity": dets[-1]["rectangularity"]}
+
+
+def state_land(mav, cam):
+    log.info("\n── STATE: DESCEND + LAND ──")
+    reset_history()
+    _desc_history.clear()
+
+    cx_f = CAM_WIDTH  // 2
+    cy_f = CAM_HEIGHT // 2
+    # During descent use near-zone speed only — gentle corrections
+    KPX  = ALIGN_SPEED_NEAR / (CAM_WIDTH  / 2)
+    KPY  = ALIGN_SPEED_NEAR / (CAM_HEIGHT / 2)
+
+    DESCEND_SPEED = 0.30    # m/s downward — gentle
+    t_start = time.time()
 
     while True:
-        if time.time() - descent_start > DESCENT_TIMEOUT_S:
-            log.warning("  Descent timeout — triggering LAND")
+        if time.time() - t_start > 60:
+            log.warning("  Descent timeout → LAND mode")
             stop_drone(mav)
-            time.sleep(0.3)
             set_mode(mav, 'LAND')
-            _log_land_result(banner_seen)
-            return True
+            return
 
-        alt = get_altitude(mav)
+        alt = get_alt(mav)
         if alt is None:
-            log.warning("  Alt: no fix — waiting")
             time.sleep(0.2)
             continue
 
-        log.info(f"  Alt: {alt:.2f}m  (LAND at ≤{LAND_ALT_M:.1f}m)")
+        log.info(f"  Alt: {alt:.2f}m")
 
-        # ── Trigger LAND ───────────────────────────────────────────────────
         if alt <= LAND_ALT_M:
-            log.info(f"  ✓ {alt:.2f}m → LAND mode")
-            stop_drone(mav)
-            time.sleep(0.5)
-            ok = set_mode(mav, 'LAND')
-            if not ok:
-                log.warning("  Retry LAND…")
-                time.sleep(0.5)
-                ok = set_mode(mav, 'LAND')
-            log.info(f"  LAND {'✓' if ok else 'FAILED'}")
-
-            land_start = time.time()
-            while time.time() - land_start < 60:
+            log.info(f"  ✓ {alt:.2f}m ≤ {LAND_ALT_M}m → LAND mode")
+            stop_drone(mav, dur=0.5)
+            set_mode(mav, 'LAND')
+            # Wait for disarm = on ground
+            t_land = time.time()
+            while time.time() - t_land < 60:
                 if not mav.motors_armed():
-                    log.info("  ✓ Disarmed — landed")
-                    _log_land_result(banner_seen)
-                    return True
-                alt_now = get_altitude(mav)
-                if alt_now is None:
-                    alt_now = 99.0
-                log.info(f"  Landing… alt={alt_now:.2f}m  armed={mav.motors_armed()}")
-                if alt_now < 0.15:
-                    log.info("  ✓ Near zero — touchdown")
-                    time.sleep(3)
-                    _log_land_result(banner_seen)
-                    return True
+                    log.info("  ✓ Disarmed — landed!")
+                    return
+                a = get_alt(mav)
+                if a is not None:
+                    log.info(f"  Landing… alt={a:.2f}m")
+                    if a < 0.15:
+                        time.sleep(2)
+                        return
+                else:
+                    log.info("  Landing…")
                 time.sleep(1)
-            log.warning("  Land wait timeout")
-            _log_land_result(banner_seen)
-            return True
-
-        # ── Descend + lateral correction ───────────────────────────────────
-        rgb    = cam.capture_array()
-        frame  = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-        banner = detect_banner_immediate(frame)   # [F9]
-
-        if banner is not None:
-            banner_seen = True
-            cx, cy   = banner["center"]
-            offset_x = cx - cx_frame
-            offset_y = cy - cy_frame
-            log.info(f"  Banner ({cx},{cy}) "
-                     f"off({offset_x:+d},{offset_y:+d}) "
-                     f"area={int(banner['area'])} "
-                     f"solid={banner.get('solidity',0):.2f}")
-            draw_debug(frame, banner, offset_x, offset_y,
-                       label=f"DESCEND alt={alt:.2f}m")
-
-            vright   = max(-ALIGN_SPEED,
-                           min(ALIGN_SPEED,  offset_x * PX_SCALE_X))
-            vforward = max(-ALIGN_SPEED,
-                           min(ALIGN_SPEED, +offset_y * PX_SCALE_Y))  # [F4]
-
-            if 0 < abs(vforward) < MIN_MOVE_SPEED:
-                vforward = MIN_MOVE_SPEED * (1 if vforward > 0 else -1)
-            if 0 < abs(vright) < MIN_MOVE_SPEED:
-                vright   = MIN_MOVE_SPEED * (1 if vright   > 0 else -1)
-        else:
-            log.info("  Banner NOT DETECTED — holding lateral, descending")
-            draw_debug(frame, None,
-                       label=f"DESCEND no-detect alt={alt:.2f}m",
-                       force_save=True)
-            vforward = 0.0
-            vright   = 0.0
-
-        send_velocity(mav, vforward, vright,
-                      down=DESCEND_SPEED, duration_s=0.3)
-
-
-def _log_land_result(banner_seen):
-    """[F8] Honest result — did we actually confirm the banner?"""
-    if banner_seen:
-        log.info("\n✓ RESULT: Landed ON banner (banner confirmed during descent)")
-    else:
-        log.warning("\n⚠ RESULT: Landed WITHOUT banner confirmation")
-        log.warning("  Drone landed at current GPS position — may not be on banner")
-        log.warning(f"  Inspect {DEBUG_SAVE_DIR}/debug_frame.jpg for clues")
-
-# ──────────────────────────────────────────────────────────────────────────────
-# MAIN
-# ──────────────────────────────────────────────────────────────────────────────
-
-def main():
-    calibrate_mode = "--calibrate" in sys.argv
-
-    log.info("=" * 60)
-    log.info("SQUADRONE — Banner Land Test")
-    log.info("Banner vs grass/tree rejection: ENABLED")
-    log.info("Search pattern: lateral only (zero yaw)")
-    if calibrate_mode:
-        log.info("MODE: HSV CALIBRATION (no flight)")
-    log.info("=" * 60)
-
-    cam = None
-    mav = None
-
-    try:
-        log.info("\n[1] Starting ArduCam…")
-        cam = start_camera()
-
-        if calibrate_mode:
-            run_hsv_calibration(cam)
             return
 
-        # [F10] Auto colour calibration
-        log.info("\n[2] Auto-calibrating banner colour…")
-        log.info("  >>> Point camera AT THE GREEN BANNER now <<<")
-        log.info("  Sampling for ~2 seconds…")
-        calibrate_banner_colour(cam, n_frames=20)
+        rgb    = cam.capture_array()
+        frame  = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        banner = _detect_descent(frame)    # [F8] rolling window during descent
 
-        # [F6] Ground check
+        if banner:
+            cx, cy   = banner["center"]
+            offset_x = cx - cx_f
+            offset_y = cy - cy_f
+            log.info(f"  Banner ({cx},{cy}) off({offset_x:+d},{offset_y:+d}) "
+                     f"alt={alt:.2f}m")
+            save_debug(frame, banner, label=f"DESCEND alt={alt:.2f}m")
+
+            vf = max(-MAX_ALIGN_SPEED,
+                     min(MAX_ALIGN_SPEED, offset_y * KPY))
+            vr = max(-MAX_ALIGN_SPEED,
+                     min(MAX_ALIGN_SPEED, offset_x * KPX))
+            if 0 < abs(vf) < MIN_ALIGN_SPEED:
+                vf = math.copysign(MIN_ALIGN_SPEED, vf)
+            if 0 < abs(vr) < MIN_ALIGN_SPEED:
+                vr = math.copysign(MIN_ALIGN_SPEED, vr)
+        else:
+            log.info(f"  Banner not visible — holding lateral, descending  alt={alt:.2f}m")
+            save_debug(frame, None,
+                       label=f"DESCEND no-detect alt={alt:.2f}m", force=True)
+            vf, vr = 0.0, 0.0
+
+        send_velocity(mav, vf, vr, down=DESCEND_SPEED, dur=0.3)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CALIBRATION MODE  — python3 test_banner_land.py --calibrate
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_calibration(cam):
+    log.info("=" * 60)
+    log.info("HSV CALIBRATION — point at banner, Ctrl+C to stop")
+    log.info(f"Saves to {DEBUG_DIR}/hsv_*.jpg  (refresh every 1 s)")
+    log.info("=" * 60)
+    kernel = np.ones((5, 5), np.uint8)
+    cx = CAM_WIDTH  // 2
+    cy = CAM_HEIGHT // 2
+    roi = 80
+    n = 0
+    try:
+        while True:
+            rgb   = cam.capture_array()
+            frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            hsv   = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+            tuned = cv2.morphologyEx(
+                cv2.inRange(hsv, LOWER_GREEN, UPPER_GREEN),
+                cv2.MORPH_OPEN, kernel)
+            broad = cv2.morphologyEx(
+                cv2.inRange(hsv, np.array([20, 30, 30]),
+                            np.array([100, 255, 255])),
+                cv2.MORPH_OPEN, kernel)
+
+            r  = hsv[cy-roi//2:cy+roi//2, cx-roi//2:cx+roi//2]
+            hm = r[:, :, 0].mean()
+            sm = r[:, :, 1].mean()
+            vm = r[:, :, 2].mean()
+
+            diag = frame.copy()
+            cv2.rectangle(diag, (cx-roi//2, cy-roi//2),
+                          (cx+roi//2, cy+roi//2), (0, 255, 255), 2)
+
+            # Run detection on this frame
+            raw = _detect_raw(frame)
+            det_label = (f"DETECTED area={raw['area']:.0f} "
+                         f"sol={raw['solidity']:.2f}"
+                         if raw else "NO DETECT")
+            lines = [
+                f"ROI  H: {r[:,:,0].min():.0f}-{r[:,:,0].max():.0f}  mean={hm:.1f}",
+                f"     S: {sm:.1f}   V: {vm:.1f}",
+                f"Broad px: {cv2.countNonZero(broad)}   "
+                f"Tuned px: {cv2.countNonZero(tuned)}",
+                f"Suggested LOWER = [{max(0,int(hm)-14)},"
+                f"{max(40,int(sm)-20)},{max(30,int(vm)-20)}]",
+                f"Suggested UPPER = [{min(179,int(hm)+14)},255,255]",
+                det_label,
+            ]
+            for i, t in enumerate(lines):
+                col = (0, 255, 0) if "DETECT" in t and "NO" not in t else (0, 200, 255)
+                cv2.putText(diag, t, (8, 22+i*22),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, col, 1)
+            cv2.imwrite(os.path.join(DEBUG_DIR, "hsv_frame.jpg"), diag)
+            cv2.imwrite(os.path.join(DEBUG_DIR, "hsv_mask.jpg"),
+                        cv2.cvtColor(tuned, cv2.COLOR_GRAY2BGR))
+            n += 1
+            log.info(f"[{n}] H={hm:.0f} S={sm:.0f} V={vm:.0f} "
+                     f"tuned={cv2.countNonZero(tuned)}  {det_label}")
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        log.info("Calibration done.")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GROUND CHECK  [F10] — saves detailed HSV mask for debugging
+# ─────────────────────────────────────────────────────────────────────────────
+
+def ground_check(cam):
+    log.info("\n── GROUND CHECK ──")
+    rgb   = cam.capture_array()
+    frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    hsv   = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    mask  = cv2.inRange(hsv, LOWER_GREEN, UPPER_GREEN)
+    mask_morph = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  _kernel)
+    mask_morph = cv2.morphologyEx(mask_morph, cv2.MORPH_CLOSE, _kernel)
+    gp    = cv2.countNonZero(mask)
+
+    # Annotated colour frame
+    ann = frame.copy()
+    cnts, _ = cv2.findContours(
+        mask_morph, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for c in cnts:
+        a = cv2.contourArea(c)
+        x, y, w, h = cv2.boundingRect(c)
+        col = (0, 255, 0) if a >= MIN_AREA else (0, 100, 255)
+        cv2.rectangle(ann, (x, y), (x+w, y+h), col, 2)
+        cv2.putText(ann, f"{a:.0f}", (x, y-4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, col, 1)
+
+    cv2.imwrite(os.path.join(DEBUG_DIR, "check_frame.jpg"), ann)
+    cv2.imwrite(os.path.join(DEBUG_DIR, "check_mask.jpg"),
+                cv2.cvtColor(mask_morph, cv2.COLOR_GRAY2BGR))
+
+    raw = _detect_raw(frame)
+    if raw:
+        log.info(f"  ✓ DETECTED  center={raw['center']}  "
+                 f"area={raw['area']:.0f}  "
+                 f"sol={raw['solidity']:.2f}  "
+                 f"rect={raw['rectangularity']:.2f}")
+    else:
+        log.info(f"  ✗ NOT DETECTED  raw_gpx={gp}")
+        if gp < 100:
+            log.warning("    → Very few green pixels. "
+                        "Run --calibrate, or fix lighting / HSV values.")
+        else:
+            log.warning(
+                f"    → Green found ({gp}px) but shape filter rejected it. "
+                f"Check: MIN_AREA={MIN_AREA} MIN_RECT={MIN_RECTANGULARITY} "
+                f"MIN_SOL={MIN_SOLIDITY}  "
+                f"  Saved: {DEBUG_DIR}/check_mask.jpg")
+    log.info(f"  Debug images: {DEBUG_DIR}/check_*.jpg")
+    return raw is not None
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main():
+    calibrate_only = "--calibrate"  in sys.argv
+    skip_calib     = "--skip-calib" in sys.argv
+    check_only     = "--check-only" in sys.argv
+
+    log.info("=" * 60)
+    log.info("SQUADRONE — Banner Land Test v5")
+    log.info("Takeoff → find banner → align → LAND (confirms detection)")
+    log.info("=" * 60)
+
+    cam = mav = None
+    try:
+        log.info("\n[1] Camera…")
+        cam = start_camera()
+
+        if calibrate_only:
+            run_calibration(cam)
+            return
+
+        if not skip_calib:
+            log.info("\n[2] Colour calibration")
+            log.info("    Point camera at the GREEN BANNER, then press ENTER.")
+            input("    >>> ENTER when banner is in frame <<<\n")
+            calibrate_banner_colour(cam, n_frames=25)
+        else:
+            log.info(f"\n[2] Calibration skipped — "
+                     f"HSV={LOWER_GREEN}→{UPPER_GREEN}")
+
         log.info("\n[3] Ground check…")
-        gp = ground_check(cam)
-        if gp < 50:
-            log.warning(f"  ⚠ Only {gp} tuned green pixels after calibration!")
-            log.warning("  Run:  python3 test_banner_land.py --calibrate")
-            ans = input("  Continue anyway? [y/N]: ").strip().lower()
+        ok = ground_check(cam)
+        if not ok:
+            log.warning("  Banner NOT detected from ground.")
+            log.warning(f"  Check {DEBUG_DIR}/check_*.jpg")
+            if check_only:
+                return
+            ans = input(
+                "  Fly anyway? [y/N]: "
+            ).strip().lower()
             if ans != 'y':
-                log.info("Aborted.")
+                return
+        else:
+            log.info("  ✓ Ground check passed")
+            if check_only:
                 return
 
-        log.info("\n[4] Connecting MAVLink…")
+        log.info("\n[4] MAVLink…")
         mav = connect_mavlink()
 
-        input("\nPress ENTER to arm and take off (Ctrl+C to abort)…\n")
+        input("\n  >>> ENTER to arm + takeoff   (Ctrl+C = abort) <<<\n")
 
-        log.info("\n[5] Arm & takeoff…")
+        log.info("\n[5] Arm + takeoff…")
         if not arm_and_takeoff(mav, TAKEOFF_ALT_M):
-            log.error("Takeoff failed → RTL")
             set_mode(mav, 'RTL')
             return
 
         time.sleep(1.0)
 
-        log.info("\n[6] Locking yaw (nose toward corridor)…")
+        log.info("\n[6] Lock heading + yaw…")
+        capture_heading(mav)
         lock_yaw(mav)
         time.sleep(0.5)
 
-        log.info("\n[7] Aligning to banner…")
-        state_align_to_banner(mav, cam)
+        log.info("\n[7] Align above banner…")
+        state_align(mav, cam)
 
-        log.info("\n[8] Descending and landing…")
-        state_land_on_banner(mav, cam)
+        log.info("\n[8] Descend + land on banner…")
+        state_land(mav, cam)
+
+        log.info("\n✓ MISSION COMPLETE")
+        log.info(f"  Debug frames: {FRAME_DIR}/")
+        log.info(f"  Live frame:   {DEBUG_DIR}/debug_frame.jpg")
 
     except KeyboardInterrupt:
         log.warning("\n!!! Ctrl+C — RTL !!!")
         if mav:
+            stop_drone(mav)
             set_mode(mav, 'RTL')
 
     except Exception as e:
-        log.error(f"\n!!! EXCEPTION: {e} — RTL !!!")
+        log.error(f"\n!!! EXCEPTION: {e} !!!")
+        import traceback; traceback.print_exc()
         if mav:
+            stop_drone(mav)
             set_mode(mav, 'RTL')
         raise
 
     finally:
         if cam:
             cam.stop()
-            log.info("Camera stopped")
-        if SHOW_WINDOW:
-            cv2.destroyAllWindows()
+        log.info("Camera stopped.")
 
 
 if __name__ == "__main__":
