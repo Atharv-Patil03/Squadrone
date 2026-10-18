@@ -1071,62 +1071,132 @@ def ground_check(cam):
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 
+def preview_thread(cam_ref, stop_event):
+    """
+    Background thread: grabs frames, applies HSV mask, shows live window.
+    Uses the global LOWER_GREEN / UPPER_GREEN (updated by in-flight calibration).
+    Press 'q' in the preview window to quit (on a display-connected machine).
+    """
+    win = "SQUADRONE — Live Preview"
+    try:
+        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(win, 640, 360)
+    except Exception:
+        return   # headless — no display available, skip silently
+
+    kernel = np.ones((5, 5), np.uint8)
+    while not stop_event.is_set():
+        try:
+            rgb   = cam_ref[0].capture_array()
+            frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            hsv   = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            mask  = cv2.morphologyEx(
+                cv2.inRange(hsv, LOWER_GREEN, UPPER_GREEN),
+                cv2.MORPH_OPEN, kernel)
+
+            # Green tint overlay where mask is active
+            overlay = frame.copy()
+            overlay[mask > 0] = [0, 200, 0]
+            display = cv2.addWeighted(frame, 0.6, overlay, 0.4, 0)
+
+            # Draw crosshair
+            cx, cy = CAM_WIDTH // 2, CAM_HEIGHT // 2
+            cv2.line(display, (cx-20, cy), (cx+20, cy), (0,255,255), 1)
+            cv2.line(display, (cx, cy-20), (cx, cy+20), (0,255,255), 1)
+
+            # Pixel count
+            gp = cv2.countNonZero(mask)
+            col = (0,255,0) if gp > MIN_AREA else (0,100,255)
+            cv2.putText(display, f"green_px={gp}", (8, 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 1)
+            cv2.putText(display,
+                        f"HSV [{LOWER_GREEN[0]}-{UPPER_GREEN[0]}]",
+                        (8, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                        (200,200,200), 1)
+
+            cv2.imshow(win, display)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                stop_event.set()
+                break
+        except Exception:
+            time.sleep(0.1)
+    cv2.destroyAllWindows()
+
+
+def auto_calibrate_inflight(cam):
+    """
+    Called after takeoff, while hovering at TAKEOFF_ALT_M.
+    Camera is now pointing straight down — banner may be visible.
+    Samples 3 seconds of frames (60 frames @ 20fps) and refines HSV.
+    Safe to call even if banner isn't in view — keeps defaults.
+    """
+    log.info("  [calib] Auto-calibrating at altitude — sampling 3 s…")
+    calibrate_banner_colour(cam, n_frames=60)
+
+
 def main():
+    import threading
+
     calibrate_only = "--calibrate"  in sys.argv
     skip_calib     = "--skip-calib" in sys.argv
     check_only     = "--check-only" in sys.argv
 
     log.info("=" * 60)
-    log.info("SQUADRONE — Banner Land Test v5")
-    log.info("Takeoff → find banner → align → LAND (confirms detection)")
+    log.info("SQUADRONE — Banner Land Test v5.2")
+    log.info("Takeoff → auto-calibrate → find banner → align → LAND")
     log.info("=" * 60)
 
     cam = mav = None
+    stop_preview = threading.Event()
+    cam_ref = [None]   # mutable ref for preview thread
+
     try:
         log.info("\n[1] Camera…")
         cam = start_camera()
+        cam_ref[0] = cam
 
         if calibrate_only:
             run_calibration(cam)
             return
 
-        if not skip_calib:
-            log.info("\n[2] Colour calibration")
-            log.info("    Point camera at the GREEN BANNER, then press ENTER.")
-            input("    >>> ENTER when banner is in frame <<<\n")
-            calibrate_banner_colour(cam, n_frames=25)
-        else:
-            log.info(f"\n[2] Calibration skipped — "
-                     f"HSV={LOWER_GREEN}→{UPPER_GREEN}")
+        # ── Live preview (background thread — non-blocking) ───────────────
+        prev_t = threading.Thread(
+            target=preview_thread, args=(cam_ref, stop_preview),
+            daemon=True)
+        prev_t.start()
+        log.info("  Live preview started (headless = silently skipped)")
 
-        log.info("\n[3] Ground check…")
-        ok = ground_check(cam)
-        if not ok:
-            log.warning("  Banner NOT detected from ground.")
-            log.warning(f"  Check {DEBUG_DIR}/check_*.jpg")
-            if check_only:
-                return
-            ans = input(
-                "  Fly anyway? [y/N]: "
-            ).strip().lower()
-            if ans != 'y':
-                return
-        else:
-            log.info("  ✓ Ground check passed")
-            if check_only:
-                return
+        # ── Skip the ground-check banner gate entirely ────────────────────
+        # Camera is pointing sideways / down on the ground, not at the banner.
+        # Just verify the camera is alive and saving frames.
+        log.info("\n[2] Camera warmup + ground snapshot…")
+        ground_check(cam)    # saves check_*.jpg but does NOT gate flight
+        log.info("  (Ground check is informational only — flight proceeds regardless)")
 
-        log.info("\n[4] MAVLink…")
+        if check_only:
+            log.info("  --check-only: done.")
+            stop_preview.set()
+            return
+
+        log.info("\n[3] MAVLink…")
         mav = connect_mavlink()
 
         input("\n  >>> ENTER to arm + takeoff   (Ctrl+C = abort) <<<\n")
 
-        log.info("\n[5] Arm + takeoff…")
+        log.info("\n[4] Arm + takeoff…")
         if not arm_and_takeoff(mav, TAKEOFF_ALT_M):
             set_mode(mav, 'RTL')
+            stop_preview.set()
             return
 
-        time.sleep(1.0)
+        time.sleep(1.5)   # settle at altitude
+
+        # ── Auto-calibrate now — camera is pointing down at the field ─────
+        if not skip_calib:
+            log.info("\n[5] In-flight auto-calibration…")
+            auto_calibrate_inflight(cam)
+        else:
+            log.info(f"\n[5] Calibration skipped — HSV={LOWER_GREEN}→{UPPER_GREEN}")
 
         log.info("\n[6] Lock heading + yaw…")
         capture_heading(mav)
@@ -1142,9 +1212,11 @@ def main():
         log.info("\n✓ MISSION COMPLETE")
         log.info(f"  Debug frames: {FRAME_DIR}/")
         log.info(f"  Live frame:   {DEBUG_DIR}/debug_frame.jpg")
+        stop_preview.set()
 
     except KeyboardInterrupt:
         log.warning("\n!!! Ctrl+C — RTL !!!")
+        stop_preview.set()
         if mav:
             stop_drone(mav)
             set_mode(mav, 'RTL')
@@ -1152,6 +1224,7 @@ def main():
     except Exception as e:
         log.error(f"\n!!! EXCEPTION: {e} !!!")
         import traceback; traceback.print_exc()
+        stop_preview.set()
         if mav:
             stop_drone(mav)
             set_mode(mav, 'RTL')
