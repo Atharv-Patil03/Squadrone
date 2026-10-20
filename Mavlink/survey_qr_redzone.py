@@ -1,37 +1,29 @@
 #!/usr/bin/env python3
 """
-SQUADRONE — Lawnmower Survey: QR scan + align, red-zone avoidance   (v1)
-File: survey_qr_redzone.py      (built on lawnmower_trial.py)
+SQUADRONE — Lawnmower Survey + QR scan & align   (QR only)
+File: survey_qr.py      (built on lawnmower_trial.py)
 Team: Squadrone AT2026RC60, PVGCOET Pune, SAEINDIA AeroTHON 2026
 
 WHAT IT DOES
-  1. Same field + lawnmower path as lawnmower_trial.py (A -> B ... -> D, inset).
-     The drone faces its direction of travel on every pass.
-  2. DOWN camera (ArduCam IMX519, rear) captures at HIGH resolution
-     (2328x1748 ≈ 5.6 mm/pixel at 10 m) so QR codes decode from altitude.
-  3. QR: every QR seen is put on a list with its ground coordinate
-     (drone position at the moment of the frame + pixel offset in metres).
-     A new QR -> pause the pass, fly over it, centre on it (descend to
-     QR_DECODE_ALT only if it won't decode from survey height), record the
-     refined coordinate + text, climb back, resume the pass.
-  4. RED ZONES: red seen by the camera is projected onto a grid map of the
-     field (+ safety margin). Every move is planned with A* on that map, so
-     the drone goes AROUND red areas; passes are re-planned the moment new
-     red appears. Known red zones can be entered before flight
-     (RED_ZONES_LATLON) and are avoided from the start.
-  5. End: summary + ~/squadrone/survey_results.json + survey_map.png.
-     If TARGET_QR is set and found -> fly to it, centre, hover HOVER_S.
-     Then RTL.
+  1. Lawnmower path inside the field A -> B ... -> D (same logic as
+     lawnmower_trial.py, with an inset). Drone faces its direction of travel.
+  2. DOWN camera (ArduCam IMX519, rear) captures at 2328x1748 (~5.6 mm/pixel
+     at 10 m) so 1 m QR codes decode from survey height.
+  3. Every QR seen gets a ground coordinate (drone position at that frame +
+     pixel offset in metres). New QR -> pause the pass, fly over it, centre on
+     it (descend to QR_DECODE_ALT_M only if it will not decode), record text +
+     refined coordinate, climb back, resume the pass.
+  4. End: summary + ~/squadrone/survey_results.json + survey_map.png.
+     --target TEXT -> fly to that QR, centre, hover HOVER_S. Then RTL.
+  SAFETY: >3 m outside the field = automatic RTL. Mode change by the pilot
+  (e.g. Loiter) = script stops immediately.
 
 RUN
-  python3 survey_qr_redzone.py --plan-only          # path + map, no drone
-  python3 survey_qr_redzone.py --bench              # camera + QR/red detection only
-  python3 survey_qr_redzone.py --alt 5 --spacing 8  # trial
-  python3 survey_qr_redzone.py --alt 10 --spacing 8 --target "ZONE-3"
-  python3 survey_qr_redzone.py --no-align           # just log QRs, don't stop
-
-INSTALL (once):  sudo apt install python3-pyzbar libzbar0
-                 (pyzbar decodes QRs better + faster; OpenCV is the fallback)
+  python3 survey_qr.py --plan-only            # path + map, no drone
+  python3 survey_qr.py --bench                # camera + QR detection only
+  python3 survey_qr.py --alt 5 --no-align     # fly the path, just log QRs
+  python3 survey_qr.py --alt 5                # stop + centre on each QR
+  python3 survey_qr.py --alt 10 --target "ZONE-3"
 """
 
 import os
@@ -39,7 +31,6 @@ import sys
 import json
 import math
 import time
-import heapq
 import signal
 import logging
 import argparse
@@ -56,53 +47,44 @@ mavutil = None
 # SETTINGS
 # ═════════════════════════════════════════════════════════════════════════════
 
-# Field — keep A, B, C, D order (recorded 17-10-2026)
-POINT_A = (18.4898160, 73.8516559)   # start (SE)
-POINT_B = (18.4898089, 73.8513138)   # end of first pass (SW)
-POINT_C = (18.4899799, 73.8512960)   # NW
-POINT_D = (18.4900219, 73.8516538)   # finish (NE)
+# Field — keep A, B, C, D order:  A = start, A->B = first pass, D = finish
+# Recorded with the drone on 20-10-2026
+POINT_A = (18.4898362, 73.8515125)   # start (SE)
+POINT_B = (18.4898302, 73.8511694)   # end of first pass (SW)
+POINT_C = (18.4900060, 73.8511663)   # NW
+POINT_D = (18.4900276, 73.8515075)   # finish (NE)
 VERTICES = [POINT_A, POINT_B, POINT_C, POINT_D]
 INSET_M = 2.0
 
-# Known red zones (optional) — list of polygons, each a list of (lat, lon)
-RED_ZONES_LATLON = []
-
 SURVEY_ALT_M    = 10.0
-SPACING_M       = 8.0     # 10 m alt sees ~13 m across -> 8 m spacing overlaps
+SPACING_M       = 8.0
 SPEED_MPS       = 1.5
 ACCEPT_RADIUS_M = 1.0
-VIA_RADIUS_M    = 0.8     # for detour points
 WAYPOINT_TIMEOUT = 120
+GEOFENCE_MARGIN_M = 3.0    # further than this outside the field -> RTL
+MAX_START_DIST_M  = 15.0   # refuse to start further than this from A
 
 # QR
 QR_ALIGN_EACH     = True   # stop and centre over every QR (False = just log)
-QR_DECODE_ALT_M   = 5.0    # descend to this if it won't decode from survey alt
+QR_DECODE_ALT_M   = 5.0    # descend to this if it will not decode from survey alt
 QR_MERGE_M        = 2.0    # sightings closer than this = same QR
 QR_VISIT_TIMEOUT  = 30
 QR_CENTRE_TOL_M   = 0.30
 QR_HOLD_S         = 1.0
+QR_SIZE_M         = 1.0    # real QR size (rulebook: 1 m x 1 m)
+QR_SIZE_TOL       = 2.5    # accept 1/2.5 .. 2.5 x the expected size
 TARGET_QR         = None   # text (or part of it) of the QR to finish over
 HOVER_S           = 10
-QR_SIZE_M         = 1.0    # real QR size (rulebook: 1 m x 1 m)
-QR_SIZE_TOL       = 2.5    # accept 1/2.5 .. 2.5 x the expected size in pixels
-
-# Red zone (team reading of the rules: > 10 s over red = -5 points)
-RED_PENALTY_S  = 10.0
-RED_MAX_S      = 5.0       # never stay over red longer than this (half the limit)
-RED_MARGIN_M   = 1.5       # normal planning keeps this far from any red
-RED_MIN_PX     = 150       # red pixels (in the 640x480 analysis image) to count
-LAB_A_MIN_RED  = 150       # Lab a* above this = clearly red (128 = neutral)
-MAP_RES_M      = 0.5
 
 # Camera (DOWN, ArduCam IMX519, rear, looking straight down)
 CAM_MODEL        = "imx519"
-CAM_RES          = (2328, 1748)   # full field of view, 2x2 binned
-ANA_RES          = (640, 480)     # analysis size for red detection
+CAM_RES          = (2328, 1748)
+PREVIEW_RES      = (640, 480)
 HFOV_DEG         = 66.0
 VFOV_DEG         = 51.0
 CAM_OFFSET_FWD_M = -0.10          # camera behind drone centre
 FLIP_X, FLIP_Y   = False, False   # image right = drone right, bottom = nose
-MAX_TILT_DEG     = 10.0           # skip geometry while tilted more than this
+MAX_TILT_DEG     = 10.0
 
 SERIAL_PORT = "/dev/ttyAMA0"
 BAUD_RATE   = 921600
@@ -203,6 +185,29 @@ def pixel_to_ground(px, py, w, h, alt, yaw):
     return east, north
 
 
+def dist_outside(x, y, poly):
+    """0 if (x, y) is inside poly, else distance (m) to the nearest edge."""
+    if point_in_poly(x, y, poly):
+        return 0.0
+    best = 1e9
+    for i in range(len(poly)):
+        (ax, ay), (bx, by) = poly[i], poly[(i + 1) % len(poly)]
+        L2 = (bx - ax) ** 2 + (by - ay) ** 2
+        t = max(0.0, min(1.0, ((x - ax) * (bx - ax) + (y - ay) * (by - ay)) / L2)) if L2 else 0
+        best = min(best, math.hypot(x - ax - t * (bx - ax), y - ay - t * (by - ay)))
+    return best
+
+
+def compass(yaw):
+    names = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+    deg = math.degrees(yaw) % 360
+    return f"{deg:.0f}° ({names[int((deg + 22.5) // 45) % 8]})"
+
+
+class GeofenceBreach(Exception):
+    pass
+
+
 def point_in_poly(x, y, poly):
     inside = False
     n = len(poly)
@@ -213,194 +218,38 @@ def point_in_poly(x, y, poly):
     return inside
 
 # ═════════════════════════════════════════════════════════════════════════════
-# GRID MAP + A*  (red zones -> blocked cells, plan around them)
+# FIELD MAP IMAGE (field outline, plan, flown track, QRs)
 # ═════════════════════════════════════════════════════════════════════════════
 
-class GridMap:
-    def __init__(self, field_poly, res=MAP_RES_M, margin=RED_MARGIN_M):
-        self.poly, self.res = field_poly, res
-        xs, ys = [p[0] for p in field_poly], [p[1] for p in field_poly]
-        self.x0, self.y0 = min(xs) - 1, min(ys) - 1
-        self.nx = int(math.ceil((max(xs) + 1 - self.x0) / res))
-        self.ny = int(math.ceil((max(ys) + 1 - self.y0) / res))
-        self.inside = np.zeros((self.ny, self.nx), np.uint8)
-        pts = np.array([[(x - self.x0) / res, (y - self.y0) / res] for x, y in field_poly])
-        cv2.fillPoly(self.inside, [np.round(pts).astype(np.int32)], 1)
-        self.red = np.zeros_like(self.inside)
-        r = max(1, int(math.ceil(margin / res)))
-        self.kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
-        self.version = 0
-        self._update()
-
-    def _update(self):
-        self.blocked = (cv2.dilate(self.red, self.kernel) > 0) | (self.inside == 0)
-        self.version += 1
-
-    def cell(self, x, y):
-        return (int(math.floor((y - self.y0) / self.res)),
-                int(math.floor((x - self.x0) / self.res)))
-
-    def centre(self, rc):
-        return (self.x0 + (rc[1] + 0.5) * self.res, self.y0 + (rc[0] + 0.5) * self.res)
-
-    def valid(self, rc):
-        return 0 <= rc[0] < self.ny and 0 <= rc[1] < self.nx
-
-    def is_blocked(self, x, y):
-        rc = self.cell(x, y)
-        return (not self.valid(rc)) or bool(self.blocked[rc])
-
-    def is_red(self, x, y):
-        """Inside red OR its safety margin."""
-        rc = self.cell(x, y)
-        return self.valid(rc) and bool(cv2.dilate(self.red, self.kernel)[rc])
-
-    def is_raw_red(self, x, y):
-        """Actually over red (what the penalty counts)."""
-        rc = self.cell(x, y)
-        return self.valid(rc) and bool(self.red[rc])
-
-    def red_length(self, p, q):
-        """Metres of the straight line p->q that lie over raw red."""
-        d = math.dist(p, q)
-        n = max(2, int(d / (self.res / 2)))
-        return sum(self.is_raw_red(*lerp(p, q, (i + 0.5) / n)) for i in range(n)) * d / n
-
-    def inside_field(self, x, y):
-        rc = self.cell(x, y)
-        return self.valid(rc) and bool(self.inside[rc])
-
-    def mark_red(self, pts):
-        changed = False
-        for x, y in pts:
-            rc = self.cell(x, y)
-            if self.valid(rc) and not self.red[rc]:
-                self.red[rc] = 1
-                changed = True
-        if changed:
-            self._update()
-        return changed
-
-    def mark_polygon(self, poly_xy):
-        pts = np.array([[(x - self.x0) / self.res, (y - self.y0) / self.res]
-                        for x, y in poly_xy])
-        cv2.fillPoly(self.red, [np.round(pts).astype(np.int32)], 1)
-        self._update()
-
-    def nearest_free(self, x, y):
-        start = self.cell(x, y)
-        if self.valid(start) and not self.blocked[start]:
-            return (x, y)
-        seen, q = {start}, deque([start])
-        while q:
-            rc = q.popleft()
-            if self.valid(rc) and not self.blocked[rc]:
-                return self.centre(rc)
-            for d in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                n = (rc[0] + d[0], rc[1] + d[1])
-                if n not in seen and -5 <= n[0] < self.ny + 5 and -5 <= n[1] < self.nx + 5:
-                    seen.add(n)
-                    q.append(n)
-        return None
-
-    def segment_clear(self, p, q):
-        d = math.dist(p, q)
-        n = max(2, int(d / (self.res / 2)))
-        return all(not self.is_blocked(*lerp(p, q, i / n)) for i in range(n + 1))
-
-    def plan(self, a, b, exact=False):
-        """A* from a to b avoiding blocked cells; returns [xy...] or None.
-        Goal inside a blocked area -> nearest free spot instead, unless
-        exact=True and b is only in the safety MARGIN (not on red): then a
-        short final hop to b is added (e.g. a QR right next to a red zone)."""
-        r = self._plan(a, b)
-        if (r is not None and exact and math.dist(r[-1], b) > 0.05
-                and not self.is_raw_red(*b) and self.inside_field(*b)):
-            r = r + [b]
-        return r
-
-    def _plan(self, a, b):
-        prefix = []
-        if self.is_blocked(*a):
-            esc = self.nearest_free(*a)
-            if esc is None:
-                return None
-            prefix, a = [esc], esc
-        goal = self.nearest_free(*b)
-        if goal is None:
-            return None
-        if self.segment_clear(a, goal):
-            return prefix + [goal]
-        s, g = self.cell(*a), self.cell(*goal)
-        openq = [(0.0, s)]
-        came, cost = {s: None}, {s: 0.0}
-        found = False
-        while openq:
-            _, cur = heapq.heappop(openq)
-            if cur == g:
-                found = True
-                break
-            for dr in (-1, 0, 1):
-                for dc in (-1, 0, 1):
-                    if dr == dc == 0:
-                        continue
-                    n = (cur[0] + dr, cur[1] + dc)
-                    if not self.valid(n) or self.blocked[n]:
-                        continue
-                    c = cost[cur] + (1.414 if dr and dc else 1.0)
-                    if c < cost.get(n, 1e9):
-                        cost[n], came[n] = c, cur
-                        heapq.heappush(openq, (c + math.hypot(n[0] - g[0], n[1] - g[1]), n))
-        if not found:
-            return None
-        cells = []
-        while cur is not None:
-            cells.append(cur)
-            cur = came[cur]
-        pts = [self.centre(c) for c in reversed(cells)]
-        pts[0], pts[-1] = a, goal
-        out, i = [], 0                  # line-of-sight smoothing
-        while i < len(pts) - 1:
-            j = len(pts) - 1
-            while j > i + 1 and not self.segment_clear(pts[i], pts[j]):
-                j -= 1
-            out.append(pts[j])
-            i = j
-        return prefix + out
-
-    def route_blocked(self, cur, route):
-        pts = [cur] + list(route)
-        return any(not self.segment_clear(pts[i], pts[i + 1]) for i in range(len(pts) - 1))
-
-    def render(self, scale=10, path=None, track=None, qrs=None, drone=None):
-        img = np.full((self.ny * scale, self.nx * scale, 3), 40, np.uint8)
-        big = lambda m: cv2.resize(m.astype(np.uint8), (self.nx * scale, self.ny * scale),
-                                   interpolation=cv2.INTER_NEAREST) > 0
-        img[big(self.inside)] = (70, 90, 70)
-        img[big(self.blocked & (self.inside > 0))] = (60, 60, 150)
-        img[big(self.red)] = (0, 0, 230)
-        ppm = scale / self.res          # image pixels per metre
-        to_px = lambda p: (int((p[0] - self.x0) * ppm), int((p[1] - self.y0) * ppm))
-        if path:
-            for i in range(len(path) - 1):
-                cv2.line(img, to_px(path[i]), to_px(path[i + 1]), (200, 200, 200), 1)
-        if track and len(track) > 1:
-            cv2.polylines(img, [np.array([to_px(p) for p in track], np.int32)], False,
-                          (255, 200, 0), 2)
-        img = cv2.flip(img, 0)          # north up
-        H = img.shape[0]
-        fl = lambda p: (to_px(p)[0], H - 1 - to_px(p)[1])
-        for q in (qrs or []):
-            col = (0, 255, 0) if q.aligned else (0, 200, 255)
-            cv2.circle(img, fl((q.x, q.y)), 6, col, 2)
-            cv2.putText(img, (q.text or "?")[:12], (fl((q.x, q.y))[0] + 8, fl((q.x, q.y))[1]),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, col, 1, cv2.LINE_AA)
-        if drone:
-            cv2.circle(img, fl(drone), 5, (255, 255, 255), -1)
-        return img
+def render_map(poly, path=None, track=None, qrs=None, drone=None, ppm=12):
+    xs, ys = [p[0] for p in poly], [p[1] for p in poly]
+    x0, y0 = min(xs) - 4, min(ys) - 4
+    W = int((max(xs) + 4 - x0) * ppm)
+    H = int((max(ys) + 4 - y0) * ppm)
+    img = np.full((H, W, 3), 40, np.uint8)
+    px = lambda p: (int((p[0] - x0) * ppm), H - 1 - int((p[1] - y0) * ppm))   # north up
+    cv2.fillPoly(img, [np.array([px(p) for p in poly], np.int32)], (70, 90, 70))
+    for lab, p in zip("ABCD", poly):
+        cv2.putText(img, lab, px(p), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    if path:
+        for i in range(len(path) - 1):
+            cv2.line(img, px(path[i]), px(path[i + 1]), (200, 200, 200), 1)
+    if track and len(track) > 1:
+        cv2.polylines(img, [np.array([px(p) for p in track], np.int32)], False, (255, 200, 0), 2)
+    for q in (qrs or []):
+        if q.rejected:
+            continue
+        col = (0, 255, 0) if q.aligned else (0, 200, 255)
+        cv2.circle(img, px((q.x, q.y)), 6, col, 2)
+        cv2.putText(img, (q.text or "?")[:14], (px((q.x, q.y))[0] + 8, px((q.x, q.y))[1]),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1, cv2.LINE_AA)
+    if drone:
+        cv2.circle(img, px(drone), 5, (255, 255, 255), -1)
+    cv2.putText(img, "N ^", (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    return img
 
 # ═════════════════════════════════════════════════════════════════════════════
-# DETECTION
+# QR DETECTION
 # ═════════════════════════════════════════════════════════════════════════════
 
 try:
@@ -409,25 +258,6 @@ try:
 except Exception:
     _HAVE_ZBAR = False
 _cv_qr = cv2.QRCodeDetector()
-
-
-def red_mask(small_bgr):
-    """Red = HSV hue near 0/180 with good saturation AND Lab a* clearly red."""
-    hsv = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2HSV)
-    a = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2LAB)[:, :, 1]
-    m = cv2.inRange(hsv, (0, 100, 60), (10, 255, 255)) | \
-        cv2.inRange(hsv, (170, 100, 60), (180, 255, 255))
-    m &= cv2.inRange(a, LAB_A_MIN_RED, 255)
-    k = np.ones((5, 5), np.uint8)
-    return cv2.morphologyEx(cv2.morphologyEx(m, cv2.MORPH_OPEN, k), cv2.MORPH_CLOSE, k)
-
-
-def red_sample_points(mask, step=8):
-    """Sparse pixel samples of the red mask (for projecting onto the map)."""
-    if cv2.countNonZero(mask) < RED_MIN_PX:
-        return []
-    ys, xs = np.nonzero(mask[::step, ::step])
-    return list(zip((xs * step).tolist(), (ys * step).tolist()))
 
 
 def scan_qr(gray):
@@ -465,9 +295,8 @@ def scan_qr(gray):
 
 
 class SurveyCam(threading.Thread):
-    """Captures high-res frames; finds red (on a small copy) and QRs (full res).
-    Every observation is queued with the frame time so the mission can use the
-    drone pose AT THAT MOMENT."""
+    """Captures high-res frames and scans for QRs. Every observation is queued
+    with the frame time so the mission can use the drone pose AT THAT MOMENT."""
 
     def __init__(self):
         super().__init__(daemon=True)
@@ -508,15 +337,12 @@ class SurveyCam(threading.Thread):
                 time.sleep(0.2)
                 continue
             t = time.time()
-            small = cv2.resize(frame, ANA_RES, interpolation=cv2.INTER_AREA)
-            rm = red_mask(small)
             qrs = scan_qr(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
-            o = {"t": t, "red": red_sample_points(rm), "qrs": qrs,
-                 "w": frame.shape[1], "h": frame.shape[0],
-                 "aw": ANA_RES[0], "ah": ANA_RES[1]}
+            o = {"t": t, "qrs": qrs, "w": frame.shape[1], "h": frame.shape[0]}
+            small = cv2.resize(frame, PREVIEW_RES, interpolation=cv2.INTER_AREA)
             with self.lk:
                 self.obs.append(o)
-                self.preview = (small, rm, qrs, frame.shape[1] / ANA_RES[0])
+                self.preview = (small, qrs, frame.shape[1] / PREVIEW_RES[0])
             n += 1
             if t - t0 > 2:
                 self.fps, n, t0 = n / (t - t0), 0, t
@@ -548,8 +374,21 @@ class Drone:
         self.origin = origin
         log.info(f"Connecting {conn} @ {baud}…")
         self.mav = mavutil.mavlink_connection(conn, baud=baud)
-        self.mav.wait_heartbeat()
-        log.info(f"  Heartbeat ✓ system={self.mav.target_system}")
+        # The first heartbeat can come from a radio / other device (system 0).
+        # Keep waiting until we see the FLIGHT CONTROLLER itself.
+        t0 = time.time()
+        while True:
+            hb = self.mav.recv_match(type="HEARTBEAT", blocking=True, timeout=3)
+            if (hb and hb.get_srcSystem() != 0
+                    and hb.get_srcComponent() == mavutil.mavlink.MAV_COMP_ID_AUTOPILOT1
+                    and hb.autopilot != mavutil.mavlink.MAV_AUTOPILOT_INVALID):
+                self.mav.target_system = hb.get_srcSystem()
+                self.mav.target_component = hb.get_srcComponent()
+                break
+            if time.time() - t0 > 30:
+                raise RuntimeError("No heartbeat from the flight controller")
+        log.info(f"  Heartbeat ✓ FC system={self.mav.target_system} "
+                 f"component={self.mav.target_component}")
         self.lk = threading.Lock()
         self.state = {}
         self.poses = deque(maxlen=400)     # (t, x, y, alt, yaw, tilt)
@@ -765,26 +604,24 @@ class Registry:
 # MISSION
 # ═════════════════════════════════════════════════════════════════════════════
 
+# ═════════════════════════════════════════════════════════════════════════════
+# MISSION
+# ═════════════════════════════════════════════════════════════════════════════
+
 class Survey:
-    def __init__(self, drone, cam, gmap, path, origin, show=True):
-        self.d, self.cam, self.map, self.path, self.origin = drone, cam, gmap, path, origin
+    def __init__(self, drone, cam, field, path, origin, show=True):
+        self.d, self.cam, self.field, self.path, self.origin = drone, cam, field, path, origin
         self.reg = Registry()
         self.track = []
-        self.t_track = 0
-        self.t_map = 0
+        self.t_track = self.t_map = 0
         self.show = show and bool(os.environ.get("DISPLAY"))
         self.status = ""
         self.yaw = 0.0
-        self.red_since = None      # when the drone started being over red
-        self.red_total = 0.0
-        self.red_worst = 0.0       # longest continuous time over red (penalty metric)
-        self.t_prev = time.time()
+        xy = drone.xy()
+        start_out = dist_outside(*xy, field) if xy else 0.0
+        self.fence_m = max(GEOFENCE_MARGIN_M, start_out + 2.0)
 
-    def red_time(self):
-        """Seconds continuously over red right now (0 if not over red)."""
-        return time.time() - self.red_since if self.red_since else 0.0
-
-    # ── observations → map + registry ────────────────────────────────────
+    # ── camera observations → QR registry ────────────────────────────────
     def process(self):
         for o in self.cam.drain():
             p = self.d.pose_at(o["t"])
@@ -793,13 +630,6 @@ class Survey:
             _, x, y, alt, yaw, tilt = p
             if alt < 2.0 or tilt > MAX_TILT_DEG:
                 continue
-            if o["red"]:
-                pts = [pixel_to_ground(px, py, o["aw"], o["ah"], alt, yaw) for px, py in o["red"]]
-                if self.map.mark_red([(x + e, y + n) for e, n in pts]):
-                    if time.time() - getattr(self, "t_redlog", 0) > 3:
-                        self.t_redlog = time.time()
-                        log.info(f"  ■ Red zone mapped near ({x:.1f}, {y:.1f}) — "
-                                 f"{self.map.red.sum() * MAP_RES_M ** 2:.0f} m² so far")
             mpp = 2 * alt * math.tan(math.radians(HFOV_DEG / 2)) / o["w"]
             for q in o["qrs"]:
                 if q.get("quad") is not None:          # size check (QR is 1 m)
@@ -809,7 +639,7 @@ class Survey:
                         continue
                 e, n = pixel_to_ground(q["c"][0], q["c"][1], o["w"], o["h"], alt, yaw)
                 qx, qy = x + e, y + n
-                if point_in_poly(qx, qy, self.map.poly):
+                if point_in_poly(qx, qy, self.field):
                     rec, _ = self.reg.add(q["text"], qx, qy)
                     rec.last_seen = o["t"]
                     rec.last_off = math.hypot(e, n)
@@ -819,22 +649,16 @@ class Survey:
         self.process()
         now = time.time()
         xy = self.d.xy()
-        dt, self.t_prev = now - self.t_prev, now
-        if xy and self.map.is_raw_red(*xy):          # penalty timer
-            self.red_since = self.red_since or now
-            self.red_total += dt
-            self.red_worst = max(self.red_worst, self.red_time())
-            if self.red_time() > RED_PENALTY_S * 0.8:
-                log.error(f"  !!! {self.red_time():.1f} s over red zone")
-        else:
-            self.red_since = None
+        if xy and dist_outside(*xy, self.field) > self.fence_m:      # hard guard
+            raise GeofenceBreach(f"drone is {dist_outside(*xy, self.field):.1f} m "
+                                 f"outside the field (limit {self.fence_m:.1f} m)")
         if xy and now - self.t_track > 0.5:
             self.track.append(xy)
             self.t_track = now
         if now - self.t_map > (0.3 if self.show else 3.0):
             self.t_map = now
-            img = self.map.render(path=[p[:2] for p in self.path], track=self.track,
-                                  qrs=self.reg.items, drone=xy)
+            img = render_map(self.field, [p[:2] for p in self.path], self.track,
+                             self.reg.items, xy)
             cv2.imwrite(os.path.join(DEBUG_DIR, "survey_map.png"), img)
             if self.show:
                 self._show(img)
@@ -844,13 +668,11 @@ class Survey:
         pv = self.cam.preview
         if pv is None:
             return
-        small, rm, qrs, s = pv
+        small, qrs, s = pv
         cam = small.copy()
-        cnts, _ = cv2.findContours(rm, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(cam, cnts, -1, (0, 0, 255), 2)
         for q in qrs:
-            quad = (q["quad"] / s).astype(np.int32)
-            cv2.polylines(cam, [quad], True, (0, 255, 0) if q["text"] else (0, 200, 255), 2)
+            cv2.polylines(cam, [(np.asarray(q["quad"]) / s).astype(np.int32)], True,
+                          (0, 255, 0) if q["text"] else (0, 200, 255), 2)
         cv2.putText(cam, self.status[:80], (8, 470), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                     (255, 255, 255), 1, cv2.LINE_AA)
         h = cam.shape[0]
@@ -866,84 +688,34 @@ class Survey:
             self.d.goto_xy(x, y, alt, self.yaw)
             self.tick(f"altitude → {alt:.0f} m")
 
-    def quick_cross(self, cur, target):
-        """No route around the red: allowed to fly STRAIGHT over it only if the
-        time over red stays under RED_MAX_S (penalty is for > RED_PENALTY_S)."""
-        red_m = self.map.red_length(cur, target)
-        t_red = red_m / SPEED_MPS
-        if t_red < RED_MAX_S:
-            log.warning(f"  No way around — crossing red directly "
-                        f"({red_m:.1f} m ≈ {t_red:.1f} s over red, limit {RED_PENALTY_S:.0f} s)")
-            return [target]
-        log.warning(f"  No way around and crossing would take {t_red:.1f} s over red — skipping")
-        return None
-
-    def goto(self, target, alt, yaw=None, handle_qr=True, accept=ACCEPT_RADIUS_M, exact=False):
-        """Fly to target (field xy) around red zones. Pauses for new QRs."""
+    def goto(self, target, alt, yaw=None, handle_qr=True, accept=ACCEPT_RADIUS_M):
+        """Fly straight to target (field xy). Pauses for new QRs, then resumes."""
         if yaw is not None:
             self.yaw = yaw
-        cur = self.d.xy()
-        route = self.map.plan(cur, target, exact)
-        crossing = False
-        if route is None:
-            route, crossing = self.quick_cross(cur, target), True
-            if route is None:
-                return False
-        ver = self.map.version
         t0 = time.time()
-        while route:
+        while True:
             self.d.check()
             if time.time() - t0 > WAYPOINT_TIMEOUT:
                 log.warning("  Waypoint timeout — skipping")
                 return False
-            cur = self.d.xy()
-            if not crossing and self.red_time() > RED_MAX_S * 0.5:
-                log.warning(f"  Over red for {self.red_time():.1f} s — leaving it now")
-                route = self.map.plan(cur, target, exact)   # starts with an escape
-                if route is None:
-                    route, crossing = self.quick_cross(cur, target), True
-                    if route is None:
-                        return False
-            if not crossing and self.map.version != ver:   # new red -> re-plan if needed
-                ver = self.map.version
-                check = route[:-1] if exact else route
-                if check and self.map.route_blocked(cur, check):
-                    log.info("  ↺ Route crosses red zone — re-planning")
-                    route = self.map.plan(cur, target, exact)
-                    if route is None:
-                        route, crossing = self.quick_cross(cur, target), True
-                        if route is None:
-                            return False
             if handle_qr:
                 q = self.reg.needs_visit()
                 if q is not None:
                     self.visit_qr(q)
-                    route = self.map.plan(self.d.xy(), target)
-                    if route is None:
-                        log.warning("  Target unreachable after QR visit — skipping")
-                        return False
-                    ver = self.map.version
                     continue
-            wp = route[0]
-            self.d.goto_xy(wp[0], wp[1], alt, self.yaw)
-            last = len(route) == 1
-            dist = math.dist(cur, wp)
-            if dist < (accept if last else VIA_RADIUS_M):
-                route.pop(0)
-            self.tick(f"→ ({wp[0]:.1f},{wp[1]:.1f}) {dist:.1f} m  alt {self.d.alt() or 0:.1f}"
-                      f"  QRs {len(self.reg.items)}"
-                      + ("  [detour]" if not last else ""))
-        return True
+            cur = self.d.xy()
+            dist = math.dist(cur, target)
+            if dist < accept:
+                return True
+            self.d.goto_xy(target[0], target[1], alt, self.yaw)
+            self.tick(f"→ ({target[0]:.1f},{target[1]:.1f}) {dist:.1f} m  "
+                      f"alt {self.d.alt() or 0:.1f}  QRs {len(self.reg.items)}")
 
     def visit_qr(self, q, hover_s=0.0):
         """Fly over QR, centre on it, decode (descending if needed), refine coord."""
         q.visits += 1
         log.info(f"\n  ▶ Visiting {q}")
-        if self.map.is_raw_red(q.x, q.y):
-            log.warning("    QR is ON a red zone — not hovering there (penalty)")
-            q.rejected = True
-            return False
-        self.goto((q.x, q.y), SURVEY_ALT_M, handle_qr=False, accept=0.6, exact=True)
+        self.goto((q.x, q.y), SURVEY_ALT_M, handle_qr=False, accept=0.6)
         alt_cmd = SURVEY_ALT_M
         t0, t_good = time.time(), None
         seen0 = getattr(q, "last_seen", 0)
@@ -952,7 +724,7 @@ class Survey:
             self.tick(f"QR #{q.id} centring  alt {self.d.alt() or 0:.1f}  "
                       f"text={q.text or '?'}")
             fresh = time.time() - getattr(q, "last_seen", 0) < 1.0
-            if (q.text is None and time.time() - t0 > 4 and alt_cmd > QR_DECODE_ALT_M):
+            if q.text is None and time.time() - t0 > 4 and alt_cmd > QR_DECODE_ALT_M:
                 alt_cmd = QR_DECODE_ALT_M
                 log.info(f"    not decoded from {SURVEY_ALT_M:.0f} m → descending to "
                          f"{QR_DECODE_ALT_M:.0f} m")
@@ -966,8 +738,7 @@ class Survey:
                 if time.time() - t_good >= QR_HOLD_S:
                     q.aligned = True
                     lat, lon = xy_to_latlon(q.x, q.y, *self.origin)
-                    log.info(f"    ✓ Centred over QR #{q.id} '{q.text}'  "
-                             f"{lat:.7f}, {lon:.7f}")
+                    log.info(f"    ✓ Centred over QR #{q.id} '{q.text}'  {lat:.7f}, {lon:.7f}")
                     break
             else:
                 t_good = None
@@ -991,10 +762,10 @@ class Survey:
         prev = self.d.xy()
         for i, (x, y, lab) in enumerate(self.path, 1):
             yaw = bearing(prev, (x, y)) if math.dist(prev, (x, y)) > 1 else self.yaw
-            log.info(f"\nWP {i}/{len(self.path)} [{lab}]  ({x:.1f}, {y:.1f})")
+            log.info(f"\nWP {i}/{len(self.path)} [{lab}]  ({x:.1f}, {y:.1f})  "
+                     f"heading {compass(yaw)}")
             self.goto((x, y), SURVEY_ALT_M, yaw=yaw)
             prev = (x, y)
-        # mop up anything still unvisited
         while self.reg.needs_visit():
             self.visit_qr(self.reg.needs_visit())
 
@@ -1004,9 +775,6 @@ class Survey:
                 lat, lon = xy_to_latlon(q.x, q.y, *self.origin)
                 log.info(f"  QR #{q.id}: '{q.text}'  {lat:.7f}, {lon:.7f}  "
                          f"{'centred' if q.aligned else 'seen'}")
-        log.info(f"  Red mapped: ~{self.map.red.sum() * MAP_RES_M ** 2:.0f} m²   "
-                 f"time over red: total {self.red_total:.1f} s, "
-                 f"longest {self.red_worst:.1f} s (penalty at {RED_PENALTY_S:.0f} s)")
         self.save()
 
         if target_text:
@@ -1015,26 +783,22 @@ class Survey:
                 log.warning(f"  Target QR '{target_text}' not found")
             else:
                 log.info(f"\n══ TARGET '{q.text}' — going there ══")
-                q.aligned = False
-                q.visits = 0
+                q.aligned, q.visits = False, 0
                 self.visit_qr(q, hover_s=HOVER_S)
 
     def save(self):
-        res = {"qrs": [], "red_cells_xy": []}
+        res = {"qrs": []}
         for q in self.reg.items:
             if q.rejected:
                 continue
             lat, lon = xy_to_latlon(q.x, q.y, *self.origin)
             res["qrs"].append({"id": q.id, "text": q.text, "lat": lat, "lon": lon,
                                "x": round(q.x, 2), "y": round(q.y, 2), "centred": q.aligned})
-        rr, cc = np.nonzero(self.map.red)
-        res["red_cells_xy"] = [list(map(lambda v: round(v, 2), self.map.centre((r, c))))
-                               for r, c in zip(rr, cc)]
         with open(os.path.join(DEBUG_DIR, "survey_results.json"), "w") as f:
             json.dump(res, f, indent=2)
         cv2.imwrite(os.path.join(DEBUG_DIR, "survey_map.png"),
-                    self.map.render(path=[p[:2] for p in self.path], track=self.track,
-                                    qrs=self.reg.items, drone=self.d.xy()))
+                    render_map(self.field, [p[:2] for p in self.path], self.track,
+                               self.reg.items, self.d.xy()))
         log.info(f"  Saved {DEBUG_DIR}/survey_results.json + survey_map.png")
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1042,13 +806,9 @@ class Survey:
 # ═════════════════════════════════════════════════════════════════════════════
 
 def plan(origin):
-    quad = [latlon_to_xy(la, lo, *origin) for la, lo in VERTICES]
-    A, B, C, D = inset_quad(quad, INSET_M)
-    path = build_lawnmower(A, B, C, D, SPACING_M)
-    gmap = GridMap(quad)
-    for poly in RED_ZONES_LATLON:
-        gmap.mark_polygon([latlon_to_xy(la, lo, *origin) for la, lo in poly])
-    return quad, path, gmap
+    field = [latlon_to_xy(la, lo, *origin) for la, lo in VERTICES]
+    A, B, C, D = inset_quad(field, INSET_M)
+    return field, build_lawnmower(A, B, C, D, SPACING_M)
 
 
 def bench():
@@ -1063,17 +823,14 @@ def bench():
             obs = cam.drain()
             pv = cam.preview
             if obs and time.time() - t_log > 0.5:
-                o = obs[-1]
-                qs = [q["text"] or "(QR shape, not decoded)" for q in o["qrs"]]
-                log.info(f"fps {cam.fps:.1f}  red samples {len(o['red'])}  QRs {qs}")
+                qs = [q["text"] or "(QR shape, not decoded)" for q in obs[-1]["qrs"]]
+                log.info(f"fps {cam.fps:.1f}  QRs {qs}")
                 t_log = time.time()
             if pv is not None:
-                small, rm, qrs, s = pv
+                small, qrs, s = pv
                 img = small.copy()
-                cnts, _ = cv2.findContours(rm, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                cv2.drawContours(img, cnts, -1, (0, 0, 255), 2)
                 for q in qrs:
-                    cv2.polylines(img, [(q["quad"] / s).astype(np.int32)], True,
+                    cv2.polylines(img, [(np.asarray(q["quad"]) / s).astype(np.int32)], True,
                                   (0, 255, 0) if q["text"] else (0, 200, 255), 2)
                     if q["text"]:
                         c = (int(q["c"][0] / s), int(q["c"][1] / s))
@@ -1091,7 +848,7 @@ def bench():
 def main():
     global SPACING_M, SURVEY_ALT_M, SPEED_MPS, INSET_M, TARGET_QR, QR_ALIGN_EACH
     global Picamera2, mavutil
-    ap = argparse.ArgumentParser(description="Squadrone survey: QR + red zones")
+    ap = argparse.ArgumentParser(description="Squadrone lawnmower survey with QR scan")
     ap.add_argument("--conn", default=SERIAL_PORT)
     ap.add_argument("--baud", type=int, default=BAUD_RATE)
     ap.add_argument("--plan-only", action="store_true")
@@ -1111,12 +868,13 @@ def main():
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
 
     log.info("=" * 60)
-    log.info(f"SQUADRONE survey  alt={SURVEY_ALT_M} spacing={SPACING_M} speed={SPEED_MPS} "
-             f"inset={INSET_M} target={TARGET_QR!r} align_each={QR_ALIGN_EACH}")
+    log.info(f"SQUADRONE QR survey  alt={SURVEY_ALT_M} spacing={SPACING_M} "
+             f"speed={SPEED_MPS} inset={INSET_M} target={TARGET_QR!r} "
+             f"align_each={QR_ALIGN_EACH}")
     log.info("=" * 60)
 
     origin = POINT_A
-    quad, path, gmap = plan(origin)
+    field, path = plan(origin)
     length = sum(math.dist(path[i][:2], path[i + 1][:2]) for i in range(len(path) - 1))
     log.info(f"Planned {len(path)} waypoints, {length:.0f} m (~{length / SPEED_MPS:.0f} s "
              f"+ QR stops)")
@@ -1124,7 +882,7 @@ def main():
         la, lo = xy_to_latlon(x, y, *origin)
         log.info(f"  WP{i:02d} [{lab:6s}] {la:.7f}, {lo:.7f}")
     cv2.imwrite(os.path.join(DEBUG_DIR, "survey_plan.png"),
-                gmap.render(path=[p[:2] for p in path]))
+                render_map(field, [p[:2] for p in path]))
     log.info(f"  Plan image: {DEBUG_DIR}/survey_plan.png")
     if a.plan_only:
         return
@@ -1145,17 +903,26 @@ def main():
     try:
         drone.wait_gps()
         xy = drone.xy()
-        log.info(f"Drone is {math.dist(xy, path[0][:2]):.1f} m from start point A")
+        log.info(f"Drone is {math.dist(xy, path[0][:2]):.1f} m from start point A, "
+                 f"{dist_outside(*xy, field):.1f} m outside the field")
+        log.info(f"FIRST MOVE after takeoff: {math.dist(xy, path[0][:2]):.1f} m towards "
+                 f"{compass(bearing(xy, path[0][:2]))} — check this matches where A is!")
+        log.info(f"Then pass 1: A → B towards {compass(bearing(path[0][:2], path[1][:2]))}")
+        if math.dist(xy, path[0][:2]) > MAX_START_DIST_M:
+            raise RuntimeError(f"More than {MAX_START_DIST_M:.0f} m from A — "
+                               "move the drone near A first")
         drone.set_param("RTL_ALT", SURVEY_ALT_M * 100)
         input("\n>>> ENTER to arm and take off (area clear!) <<<\n")
         drone.arm_and_takeoff(SURVEY_ALT_M)
-        Survey(drone, cam, gmap, path, origin).run(TARGET_QR)
+        Survey(drone, cam, field, path, origin).run(TARGET_QR)
         log.info("\n✓ Done — RTL")
     except KeyboardInterrupt:
         log.warning("Ctrl+C — aborting")
     except PilotTookOver:
         took_over = True
         log.warning(f"Pilot / failsafe took over (mode {drone.mode()}) — script exits")
+    except GeofenceBreach as e:
+        log.error(f"!!! GEOFENCE: {e} — RTL")
     except Exception as e:
         log.error(f"ERROR: {e}")
         import traceback
