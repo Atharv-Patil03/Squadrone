@@ -67,7 +67,8 @@ MAX_START_DIST_M  = 15.0   # refuse to start further than this from A
 # QR
 QR_ALIGN_EACH     = True   # stop and centre over every QR (False = just log)
 QR_DECODE_ALT_M   = 5.0    # descend to this if it will not decode from survey alt
-QR_MERGE_M        = 2.0    # sightings closer than this = same QR
+QR_MERGE_M        = 2.0    # undecoded sightings closer than this = same QR
+QR_TEXT_MERGE_M   = 8.0    # same text within this = same QR
 QR_VISIT_TIMEOUT  = 30
 QR_CENTRE_TOL_M   = 0.30
 QR_HOLD_S         = 1.0
@@ -83,7 +84,9 @@ PREVIEW_RES      = (640, 480)
 HFOV_DEG         = 66.0
 VFOV_DEG         = 51.0
 CAM_OFFSET_FWD_M = -0.10          # camera behind drone centre
-FLIP_X, FLIP_Y   = False, False   # image right = drone right, bottom = nose
+# FLIP_Y = True: flight 20-10 showed QR positions sliding WITH the drone along
+# track (and the banner drifting back) = forward/back was reversed.
+FLIP_X, FLIP_Y   = False, True
 MAX_TILT_DEG     = 10.0
 
 SERIAL_PORT = "/dev/ttyAMA0"
@@ -570,11 +573,17 @@ class Registry:
         self.items = []
 
     def add(self, text, x, y):
+        x, y = float(x), float(y)
         best = None
         for q in self.items:
             d = math.hypot(q.x - x, q.y - y)
-            same = (text is None or q.text is None or q.text == text)
-            if d < QR_MERGE_M and same and (best is None or d < best[0]):
+            if text and q.text == text:
+                limit = QR_TEXT_MERGE_M          # same text = same QR (unless far)
+            elif text is None or q.text is None:
+                limit = QR_MERGE_M
+            else:
+                continue                         # different texts never merge
+            if d < limit and (best is None or d < best[0]):
                 best = (d, q)
         if best:
             q = best[1]
@@ -787,18 +796,23 @@ class Survey:
                 self.visit_qr(q, hover_s=HOVER_S)
 
     def save(self):
+        cv2.imwrite(os.path.join(DEBUG_DIR, "survey_map.png"),      # map first
+                    render_map(self.field, [p[:2] for p in self.path], self.track,
+                               self.reg.items, self.d.xy()))
         res = {"qrs": []}
         for q in self.reg.items:
             if q.rejected:
                 continue
             lat, lon = xy_to_latlon(q.x, q.y, *self.origin)
-            res["qrs"].append({"id": q.id, "text": q.text, "lat": lat, "lon": lon,
-                               "x": round(q.x, 2), "y": round(q.y, 2), "centred": q.aligned})
-        with open(os.path.join(DEBUG_DIR, "survey_results.json"), "w") as f:
-            json.dump(res, f, indent=2)
-        cv2.imwrite(os.path.join(DEBUG_DIR, "survey_map.png"),
-                    render_map(self.field, [p[:2] for p in self.path], self.track,
-                               self.reg.items, self.d.xy()))
+            res["qrs"].append({"id": int(q.id), "text": q.text,
+                               "lat": round(float(lat), 7), "lon": round(float(lon), 7),
+                               "x": round(float(q.x), 2), "y": round(float(q.y), 2),
+                               "sightings": int(q.n), "centred": bool(q.aligned)})
+        try:
+            with open(os.path.join(DEBUG_DIR, "survey_results.json"), "w") as f:
+                json.dump(res, f, indent=2)
+        except Exception as e:                      # never let saving stop the flight
+            log.error(f"  could not save results: {e}")
         log.info(f"  Saved {DEBUG_DIR}/survey_results.json + survey_map.png")
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -811,20 +825,39 @@ def plan(origin):
     return field, build_lawnmower(A, B, C, D, SPACING_M)
 
 
-def bench():
+def bench(dist=None):
+    """dist = distance camera->QR in metres (for FOV measurement + direction check)."""
     cam = SurveyCam()
     cam.open()
     cam.start()
     log.info("BENCH — no flight. Ctrl+C to stop.")
+    if dist:
+        log.info(f"  FOV mode: QR ({QR_SIZE_M} m) at {dist} m from the lens")
     show = bool(os.environ.get("DISPLAY"))
     t_log = 0
+    fovs = []
     try:
         while True:
             obs = cam.drain()
             pv = cam.preview
             if obs and time.time() - t_log > 0.5:
-                qs = [q["text"] or "(QR shape, not decoded)" for q in obs[-1]["qrs"]]
+                o = obs[-1]
+                qs = [q["text"] or "(QR shape, not decoded)" for q in o["qrs"]]
                 log.info(f"fps {cam.fps:.1f}  QRs {qs}")
+                if dist:
+                    for q in o["qrs"]:
+                        if not q["text"]:
+                            continue
+                        quad = np.asarray(q["quad"], np.float32).reshape(-1, 2)
+                        side_px = math.sqrt(cv2.contourArea(quad))
+                        # QR spans side_px of W pixels -> real HFOV
+                        hfov = 2 * math.degrees(math.atan(
+                            (o["w"] / side_px) * QR_SIZE_M / 2 / dist))
+                        fovs.append(hfov)
+                        e, n = pixel_to_ground(q["c"][0], q["c"][1], o["w"], o["h"], dist, 0.0)
+                        log.info(f"    QR side {side_px:.0f}px → camera HFOV ≈ {hfov:.1f}° "
+                                 f"(median {np.median(fovs):.1f}°, script uses {HFOV_DEG}°)  "
+                                 f"| QR is fwd={n - CAM_OFFSET_FWD_M:+.2f} m, rgt={e:+.2f} m")
                 t_log = time.time()
             if pv is not None:
                 small, qrs, s = pv
@@ -859,6 +892,7 @@ def main():
     ap.add_argument("--inset", type=float, default=INSET_M)
     ap.add_argument("--target", default=TARGET_QR, help="QR text to finish over")
     ap.add_argument("--no-align", action="store_true", help="log QRs, don't stop at each")
+    ap.add_argument("--dist", type=float, help="bench: camera-to-QR distance (m) to measure FOV")
     a = ap.parse_args()
     if not (1 <= a.spacing <= 30 and 3 <= a.alt <= 30 and 0.5 <= a.speed <= 5
             and 0 <= a.inset <= 5):
@@ -890,7 +924,7 @@ def main():
     from picamera2 import Picamera2 as _P
     Picamera2 = _P
     if a.bench:
-        bench()
+        bench(a.dist)
         return
     from pymavlink import mavutil as _m
     mavutil = _m
