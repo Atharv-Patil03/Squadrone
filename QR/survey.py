@@ -351,6 +351,10 @@ def scan_qr(bgr):
         # chewing on soil texture) — small QRs are covered by the tiles.
         half = cv2.resize(bgr, (bgr.shape[1] // 2, bgr.shape[0] // 2),
                           interpolation=cv2.INTER_AREA)
+        # Light denoise: on busy texture (soil, grass) WeChat's CNN finds dozens
+        # of false candidates and took 4-5 s per frame; sigma 1 px removes that
+        # (-> ~11 ms) while QR modules (several px) are untouched.
+        half = cv2.GaussianBlur(half, (0, 0), 1.0)
         for d in _decode_wechat(half):
             d["quad"] = d["quad"] * 2.0
             d["c"] = (d["c"][0] * 2.0, d["c"][1] * 2.0)
