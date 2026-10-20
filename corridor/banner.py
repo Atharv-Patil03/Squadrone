@@ -139,9 +139,9 @@ LAB_A_MAX   = 120          # OpenCV a*: 128 = neutral, lower = greener
 MIN_FILL      = 0.60       # contour area / min-area rotated rectangle
 MIN_SOLIDITY  = 0.75       # contour area / convex hull
 MAX_ELONG     = 5.0        # long side / short side of rotated rectangle
-TEX_PIX_MAX   = 12         # per-pixel texture gate (grass pixels dropped)
-MAX_TEXTURE   = 9.0        # mean texture inside a blob
-MAX_AREA_FRAC = 0.5        # blob bigger than half the frame = not a banner
+TEX_PIX_MAX   = 18         # per-pixel texture gate (grass ~28, creased banner 11-14)
+MAX_TEXTURE   = 18.0       # mean texture inside a blob (same scale)
+MAX_AREA_FRAC = 1.01       # no limit: up close the banner may fill the whole frame
 AMBIGUOUS     = 0.85       # 2nd-best score >= 85 % of best -> no decision
 DOWN_MIN_AREA = 400
 FWD_MIN_AREA  = 120
@@ -166,6 +166,8 @@ logging.basicConfig(
 log = logging.getLogger("dual")
 
 _k5 = np.ones((5, 5), np.uint8)
+HEAL_PX = 17                                   # closes cuts up to ~15 px wide
+_k_heal = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (HEAL_PX, HEAL_PX))
 
 # ═════════════════════════════════════════════════════════════════════════════
 # GEOMETRY
@@ -240,20 +242,44 @@ def green_mask(bgr):
     m = cv2.bitwise_and(m, cv2.inRange(a, 0, LAB_A_MAX))
     m = cv2.bitwise_and(m, cv2.inRange(tex, 0, TEX_PIX_MAX))
     m = cv2.morphologyEx(m, cv2.MORPH_OPEN, _k5)
-    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, _k5, iterations=2)
+    # heal thin cuts (creases, folds, streaks, shadow edges) so the banner is
+    # ONE blob again; grass stays out because it was removed pixel-by-pixel
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, _k_heal)
     return m, tex
 
 
-def detect_raw(bgr, min_area, alt=None):
+def detect_raw(bgr, min_area, alt=None, why=None):
     """
     Score every green blob, return the best banner candidate (or None).
       fill     = area / rotated-rectangle area   (works at ANY rotation)
       solidity = area / convex hull              (grass/trees are ragged)
-      texture  = brightness std-dev inside blob  (printed banner is flat)
+      texture  = local detail inside blob        (printed banner is flat)
+    why: pass a list to get a plain-English reason for every rejection.
     """
     mask, tex = green_mask(bgr)
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     max_area = MAX_AREA_FRAC * CAM_W * CAM_H
+    if why is not None:
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        a = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)[:, :, 1]
+        col = cv2.inRange(hsv, LOWER_GREEN, UPPER_GREEN)
+        col_lab = cv2.bitwise_and(col, cv2.inRange(a, 0, LAB_A_MAX))
+        n = CAM_W * CAM_H / 100.0
+        why.append(f"green(HSV) {cv2.countNonZero(col) / n:.0f}%  "
+                   f"+Lab {cv2.countNonZero(col_lab) / n:.0f}%  "
+                   f"+smooth(tex<{TEX_PIX_MAX}) {cv2.countNonZero(mask) / n:.0f}%  "
+                   f"blobs={len(cnts)}")
+        if cv2.countNonZero(col):
+            why.append(f"  green pixels: median H={np.median(hsv[:, :, 0][col > 0]):.0f} "
+                       f"S={np.median(hsv[:, :, 1][col > 0]):.0f} "
+                       f"V={np.median(hsv[:, :, 2][col > 0]):.0f}  "
+                       f"Lab a*={np.median(a[col > 0]):.0f} (max {LAB_A_MAX})  "
+                       f"texture median={np.median(tex[col > 0]):.0f} (max {TEX_PIX_MAX})")
+        cnts = sorted(cnts, key=cv2.contourArea, reverse=True)
+
+    def reject(c, msg):
+        if why is not None and len(why) < 6:
+            why.append(f"  blob area={cv2.contourArea(c):.0f}px REJECTED: {msg}")
 
     exp_area = None
     if BANNER_SIZE_M and alt and alt > 0.5:
@@ -263,7 +289,12 @@ def detect_raw(bgr, min_area, alt=None):
     cands = []
     for c in cnts:
         area = cv2.contourArea(c)
-        if area < min_area or area > max_area:
+        if area < min_area:
+            if why is not None and area > 50:
+                reject(c, f"too small (< {min_area})")
+            continue
+        if area > max_area:
+            reject(c, f"too big (> {MAX_AREA_FRAC:.0%} of frame)")
             continue
         (rcx, rcy), (rw, rh), ang = cv2.minAreaRect(c)
         if rw < 2 or rh < 2:
@@ -272,16 +303,28 @@ def detect_raw(bgr, min_area, alt=None):
         elong = max(rw, rh) / min(rw, rh)
         hull_a = cv2.contourArea(cv2.convexHull(c))
         solidity = area / hull_a if hull_a else 0
-        if fill < MIN_FILL or solidity < MIN_SOLIDITY or elong > MAX_ELONG:
+        if fill < MIN_FILL:
+            reject(c, f"not rectangular: fill={fill:.2f} < {MIN_FILL}")
+            continue
+        if solidity < MIN_SOLIDITY:
+            reject(c, f"ragged edge: solidity={solidity:.2f} < {MIN_SOLIDITY}")
+            continue
+        if elong > MAX_ELONG:
+            reject(c, f"too long/thin: {elong:.1f} > {MAX_ELONG}")
             continue
         if exp_area and not (exp_area / SIZE_TOL <= area <= exp_area * SIZE_TOL):
+            reject(c, f"wrong size for altitude (expected ~{exp_area:.0f}px)")
             continue
         x, y, w, h = cv2.boundingRect(c)
         blob = np.zeros((h, w), np.uint8)
         cv2.drawContours(blob, [c - [x, y]], -1, 255, -1)
         texture = float(cv2.mean(tex[y:y + h, x:x + w], mask=blob)[0])
         if texture > MAX_TEXTURE:
+            reject(c, f"too textured: {texture:.1f} > {MAX_TEXTURE}")
             continue
+        if why is not None:
+            why.append(f"  blob area={area:.0f}px OK  fill={fill:.2f} sol={solidity:.2f} "
+                       f"tex={texture:.1f}")
         m = cv2.moments(c)
         score = (fill * solidity * (1.0 - 0.5 * texture / MAX_TEXTURE)
                  * min(1.0, math.sqrt(area / (min_area * 6))))
@@ -293,6 +336,9 @@ def detect_raw(bgr, min_area, alt=None):
         return None, mask
     cands.sort(key=lambda d: d["score"], reverse=True)
     if len(cands) >= 2 and cands[1]["score"] >= AMBIGUOUS * cands[0]["score"]:
+        if why is not None:
+            why.append(f"  REJECTED: two equally good blobs (scores {cands[0]['score']:.2f} "
+                       f"/ {cands[1]['score']:.2f}) — e.g. banner split by a shadow/crease")
         return None, mask        # two equally good blobs — don't guess
     return cands[0], mask
 
@@ -1042,8 +1088,15 @@ def bench(down, fwd, pv, alt=SEARCH_ALT_M):
         status = " | ".join(parts)
         pv.update(down, fwd, status)
         now = time.time()
-        if now - t_log > 0.5:
+        if now - t_log > (0.5 if dc else 1.5):
             log.info(status + f"   fps {down.fps:.0f}")
+            if not dc:                                 # explain WHY nothing is found
+                fr = down.get()[0]
+                if fr is not None:
+                    why = []
+                    detect_raw(fr, DOWN_MIN_AREA, None, why)
+                    for line in why:
+                        log.info("    " + line)
             t_log = now
         if now - t_mask > 1.0:
             m = down.get_mask()
@@ -1061,8 +1114,18 @@ def main():
     from picamera2 import Picamera2 as _P
     Picamera2 = _P
 
+    global TEX_PIX_MAX, MAX_TEXTURE
     bench_mode = "--bench" in sys.argv
     use_fwd = "--down-only" not in sys.argv
+    # field tuning without editing the file:
+    #   --tex 20   allow more texture (creased / shiny banner)
+    #   --no-tex   switch the texture filter off completely (diagnosis)
+    if "--no-tex" in sys.argv:
+        TEX_PIX_MAX, MAX_TEXTURE = 255, 255.0
+    elif "--tex" in sys.argv:
+        v = float(sys.argv[sys.argv.index("--tex") + 1])
+        TEX_PIX_MAX, MAX_TEXTURE = int(v), v * 0.75
+    log.info(f"  texture limits: pixel {TEX_PIX_MAX}, blob {MAX_TEXTURE}")
     log.info("=" * 64)
     log.info(f"SQUADRONE — banner search v2  ({'BENCH' if bench_mode else 'FLIGHT'}, "
              f"final={FINAL_ACTION}, AI cam={'fallback' if use_fwd else 'off'})")
