@@ -498,6 +498,7 @@ class Drone:
         self.state = {}
         self.lk = threading.Lock()
         self._stop_evt = threading.Event()
+        self.ground_z = None
 
     def connect(self):
         log.info(f"Connecting {SERIAL_PORT} @ {BAUD_RATE}…")
@@ -530,6 +531,17 @@ class Drone:
                 continue
             if m is None or m.get_type() == "BAD_DATA":
                 continue
+            # Only trust the FLIGHT CONTROLLER (our sysid, autopilot component).
+            # The FC also forwards heartbeats from Mission Planner / ELRS /
+            # radios — those say "disarmed, mode 0" and must be ignored.
+            if m.get_srcSystem() != self.mav.target_system:
+                continue
+            if m.get_type() == "HEARTBEAT" and (
+                    m.get_srcComponent() != mavutil.mavlink.MAV_COMP_ID_AUTOPILOT1
+                    or m.type in (mavutil.mavlink.MAV_TYPE_GCS,
+                                  mavutil.mavlink.MAV_TYPE_ONBOARD_CONTROLLER)
+                    or m.autopilot == mavutil.mavlink.MAV_AUTOPILOT_INVALID):
+                continue
             with self.lk:
                 self.state[m.get_type()] = m
             if m.get_type() == "STATUSTEXT":
@@ -543,10 +555,24 @@ class Drone:
         m = self.get("LOCAL_POSITION_NED")
         return (m.x, m.y, m.z) if m else None
 
+    def set_ground(self):
+        """Remember the ground level at the takeoff spot (local z drifts and is
+        relative to where the EKF started, not to the ground)."""
+        zs = []
+        t0 = time.time()
+        while time.time() - t0 < 1.0:
+            m = self.get("LOCAL_POSITION_NED")
+            if m:
+                zs.append(m.z)
+            time.sleep(0.05)
+        self.ground_z = float(np.median(zs)) if zs else None
+        log.info(f"  Ground level set (local z = {self.ground_z})")
+
     def alt(self):
+        """Height above the takeoff spot, metres."""
         m = self.get("LOCAL_POSITION_NED")
-        if m:
-            return -m.z
+        if m and self.ground_z is not None:
+            return self.ground_z - m.z
         g = self.get("GLOBAL_POSITION_INT")
         return g.relative_alt / 1000.0 if g else None
 
@@ -595,15 +621,18 @@ class Drone:
             mavutil.mavlink.MAV_CMD_DO_CHANGE_SPEED, 0, 1, ms, -1, 0, 0, 0, 0)
 
     def goto_ned(self, n, e, alt, yaw):
-        """Absolute local-NED position + absolute yaw (FC holds it vs wind)."""
+        """Absolute local-NED position + absolute yaw (FC holds it vs wind).
+        alt = metres above the takeoff spot."""
+        z = (self.ground_z if self.ground_z is not None else 0.0) - alt
         self.mav.mav.set_position_target_local_ned_send(
             0, self.mav.target_system, self.mav.target_component,
             mavutil.mavlink.MAV_FRAME_LOCAL_NED, 0b0000100111111000,
-            n, e, -alt, 0, 0, 0, 0, 0, 0, yaw, 0)
+            n, e, z, 0, 0, 0, 0, 0, 0, yaw, 0)
 
     def arm_and_takeoff(self, alt):
         if not self.set_mode("GUIDED"):
             return False
+        self.set_ground()
         log.info("  Arming…")
         t0 = time.time()
         while not self.armed() and time.time() - t0 < 15:
@@ -619,18 +648,23 @@ class Drone:
         self.mav.mav.command_long_send(
             self.mav.target_system, self.mav.target_component,
             mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 0, 0, 0, 0, 0, alt)
-        t0, t_log = time.time(), 0
+        t0, t_log, t_disarm = time.time(), 0, None
         while time.time() - t0 < TAKEOFF_TIMEOUT:
             a = self.alt() or 0.0
             if time.time() - t_log > 1.0:
-                log.info(f"  Alt {a:.2f} / {alt:.1f} m")
+                log.info(f"  Alt {a:.2f} / {alt:.1f} m   mode={self.mode()}")
                 t_log = time.time()
             if a >= alt * TAKEOFF_ACCEPT:
                 log.info("  Takeoff done ✓")
                 return True
+            # disarmed must persist 1.5 s — one stray message can't abort a takeoff
             if not self.armed():
-                log.error("  Disarmed during takeoff")
-                return False
+                t_disarm = t_disarm or time.time()
+                if time.time() - t_disarm > 1.5:
+                    log.error("  FC disarmed during takeoff (check Mission Planner messages)")
+                    return False
+            else:
+                t_disarm = None
             time.sleep(0.2)
         a = self.alt() or 0.0
         if a >= alt * 0.7:
