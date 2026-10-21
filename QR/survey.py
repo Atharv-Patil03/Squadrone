@@ -48,12 +48,15 @@ mavutil = None
 # ═════════════════════════════════════════════════════════════════════════════
 
 # Field — keep A, B, C, D order:  A = start, A->B = first pass, D = finish
-# Recorded with the drone on 20-10-2026
-POINT_A = (18.4898362, 73.8515125)   # start (SE)
-POINT_B = (18.4898302, 73.8511694)   # end of first pass (SW)
-POINT_C = (18.4900060, 73.8511663)   # NW
-POINT_D = (18.4900276, 73.8515075)   # finish (NE)
+# 40 x 30 m field, recorded with the drone on 21-10-2026
+POINT_A = (18.4897888, 73.8516870)   # start (SE)
+POINT_B = (18.4897842, 73.8512713)   # end of first pass (SW)
+POINT_C = (18.4900559, 73.8512742)   # NW
+POINT_D = (18.4900635, 73.8516404)   # finish (NE)
 VERTICES = [POINT_A, POINT_B, POINT_C, POINT_D]
+# Corners recorded BY THE DRONE (python survey.py --record A ... D) are saved
+# here and override the values above. Delete the file to go back to them.
+CORNERS_FILE = os.path.expanduser("~/squadrone/field_corners.json")
 INSET_M = 2.0
 
 SURVEY_ALT_M    = 10.0
@@ -62,11 +65,14 @@ SPEED_MPS       = 1.5
 ACCEPT_RADIUS_M = 1.0
 WAYPOINT_TIMEOUT = 120
 GEOFENCE_MARGIN_M = 3.0    # further than this outside the field -> RTL
-MAX_START_DIST_M  = 15.0   # refuse to start further than this from A
+MAX_START_DIST_M  = 60.0   # refuse to start further than this from A
+WARN_START_DIST_M = 15.0   # warn (but allow) beyond this
 
 # QR
 QR_ALIGN_EACH     = True   # stop and centre over every QR (False = just log)
-QR_DECODE_ALT_M   = 5.0    # descend to this if it will not decode from survey alt
+QR_DECODE_ALT_M   = None   # None = never leave survey alt (rulebook: 10 m).
+                           # --decode-alt 8 allows dropping to 8 m over a hard QR
+EXPOSURE_EV       = -1.0   # darker exposure: glossy QR in sun glare stays readable
 QR_MERGE_M        = 2.0    # undecoded sightings closer than this = same QR
 QR_TEXT_MERGE_M   = 8.0    # same text within this = same QR
 QR_VISIT_TIMEOUT  = 30
@@ -322,6 +328,9 @@ def _decode_wechat(bgr, ox=0, oy=0, by="wechat"):
 # Bench: 85 px QR -> 0/5 full frame, 5/5 tiled. All tiles every frame is too
 # slow, so each frame = full frame + ONE tile, round robin.
 SCAN_TILES = 3            # 3x3 tiles, 25 % overlap (0 = off)
+GLARE_PASS = True         # retry with contrast equalisation when nothing decodes
+_clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+_glare_i = 0
 _tile_i = 0
 
 
@@ -355,7 +364,16 @@ def scan_qr(bgr):
         # of false candidates and took 4-5 s per frame; sigma 1 px removes that
         # (-> ~11 ms) while QR modules (several px) are untouched.
         half = cv2.GaussianBlur(half, (0, 0), 1.0)
-        for d in _decode_wechat(half):
+        found = _decode_wechat(half)
+        global _glare_i
+        _glare_i += 1
+        if not found and GLARE_PASS and _glare_i % 2 == 0:     # every other frame
+            # Glare washes the QR out (dark modules turn light grey). Local
+            # contrast equalisation brings the pattern back.
+            g = cv2.cvtColor(half, cv2.COLOR_BGR2GRAY)
+            found = _decode_wechat(cv2.cvtColor(_clahe.apply(g), cv2.COLOR_GRAY2BGR),
+                                   by="wechat-glare")
+        for d in found:
             d["quad"] = d["quad"] * 2.0
             d["c"] = (d["c"][0] * 2.0, d["c"][1] * 2.0)
             out.append(d)
@@ -423,7 +441,8 @@ class SurveyCam(threading.Thread):
         focus = ({"AfMode": 0, "LensPosition": 1.0 / FOCUS_M} if FOCUS_M     # manual
                  else {"AfMode": 2, "AfSpeed": 1})                          # continuous
         for ctrl in ({"AwbEnable": True, "AwbMode": 5}, focus,
-                     {"AeExposureMode": 1}):          # short exposure = less motion blur
+                     {"AeExposureMode": 1},           # short exposure = less motion blur
+                     {"ExposureValue": EXPOSURE_EV}): # glare: keep whites from blowing out
             try:
                 self.cam.set_controls(ctrl)
             except Exception as e:
@@ -838,9 +857,14 @@ class Survey:
             self.tick(f"QR #{q.id} centring  alt {self.d.alt() or 0:.1f}  "
                       f"text={q.text or '?'}")
             fresh = time.time() - getattr(q, "last_seen", 0) < 1.0
-            if q.text is None and time.time() - t0 > 4 and alt_cmd > QR_DECODE_ALT_M:
+            # Drop to QR_DECODE_ALT_M if it won't decode (4 s) OR won't hold
+            # steady enough to centre (8 s) — e.g. sun glare at 10 m.
+            el = time.time() - t0
+            if QR_DECODE_ALT_M and alt_cmd > QR_DECODE_ALT_M and ((q.text is None and el > 4)
+                                              or (el > 8 and t_good is None)):
                 alt_cmd = QR_DECODE_ALT_M
-                log.info(f"    not decoded from {SURVEY_ALT_M:.0f} m → descending to "
+                why = "not decoded" if q.text is None else "can't hold it in view"
+                log.info(f"    {why} from {SURVEY_ALT_M:.0f} m → descending to "
                          f"{QR_DECODE_ALT_M:.0f} m")
             self.d.goto_xy(q.x, q.y, alt_cmd, self.yaw)
             cur = self.d.xy()
@@ -880,6 +904,11 @@ class Survey:
                      f"heading {compass(yaw)}")
             self.goto((x, y), SURVEY_ALT_M, yaw=yaw)
             prev = (x, y)
+            if i == 1 and self.fence_m > GEOFENCE_MARGIN_M:
+                # Reached A: the trip from takeoff is over — tighten the guard.
+                self.fence_m = GEOFENCE_MARGIN_M
+                log.info(f"  At A — geofence guard now {GEOFENCE_MARGIN_M:.0f} m "
+                         "outside the field")
         while self.reg.needs_visit():
             self.visit_qr(self.reg.needs_visit())
 
@@ -923,6 +952,64 @@ class Survey:
 # ═════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═════════════════════════════════════════════════════════════════════════════
+
+def load_corners():
+    """Use drone-recorded corners if the file exists (all four required)."""
+    global POINT_A, POINT_B, POINT_C, POINT_D, VERTICES
+    if not os.path.isfile(CORNERS_FILE):
+        log.info("  Corners: built-in values (no field_corners.json)")
+        return
+    with open(CORNERS_FILE) as f:
+        c = json.load(f)
+    missing = [k for k in "ABCD" if k not in c]
+    if missing:
+        raise SystemExit(f"field_corners.json is missing {', '.join(missing)} — record "
+                         f"them with --record, or delete {CORNERS_FILE}")
+    POINT_A, POINT_B, POINT_C, POINT_D = (tuple(c[k]) for k in "ABCD")
+    VERTICES = [POINT_A, POINT_B, POINT_C, POINT_D]
+    log.info(f"  Corners: from {CORNERS_FILE} (recorded by the drone)")
+
+
+def record_corner(label, conn, baud):
+    """Stand the drone ON the corner, then run this. Averages 10 s of GPS."""
+    drone = Drone(conn, baud, POINT_A)
+    drone.wait_gps()
+    log.info(f"Recording corner {label}: keep the drone still for 10 s…")
+    pts, t0, last = [], time.time(), None
+    while time.time() - t0 < 10:
+        m = drone.get("GLOBAL_POSITION_INT")
+        if m is not None and m is not last:
+            pts.append((m.lat / 1e7, m.lon / 1e7))
+            last = m
+        time.sleep(0.1)
+    drone.close()
+    if len(pts) < 10:
+        raise SystemExit("Too few GPS samples — check telemetry")
+    lat = float(np.median([p[0] for p in pts]))
+    lon = float(np.median([p[1] for p in pts]))
+    spread = max(math.dist((0, 0), latlon_to_xy(p[0], p[1], lat, lon)) for p in pts)
+    g = drone.get("GPS_RAW_INT")
+    c = {}
+    if os.path.isfile(CORNERS_FILE):
+        with open(CORNERS_FILE) as f:
+            c = json.load(f)
+    c[label] = [round(lat, 7), round(lon, 7)]
+    with open(CORNERS_FILE, "w") as f:
+        json.dump(c, f, indent=2)
+    log.info(f"  ✓ Corner {label} = {lat:.7f}, {lon:.7f}   ({len(pts)} samples, "
+             f"wander {spread:.1f} m, sats {g.satellites_visible if g else '?'}, "
+             f"hdop {g.eph / 100 if g else 0:.2f})")
+    if spread > 2.0:
+        log.warning("  GPS wandered > 2 m while recording — wait for better GPS and redo")
+    order = [k for k in "ABCD" if k in c]
+    for k1, k2 in zip(order, order[1:]):
+        x, y = latlon_to_xy(*c[k2], *c[k1])
+        log.info(f"    {k1} → {k2}: {math.hypot(x, y):.1f} m, heading "
+                 f"{compass(math.atan2(x, y))}")
+    left = [k for k in "ABCD" if k not in c]
+    log.info(f"  Saved to {CORNERS_FILE}. " +
+             (f"Still to record: {', '.join(left)}" if left else "All four corners recorded."))
+
 
 def plan(origin):
     field = [latlon_to_xy(la, lo, *origin) for la, lo in VERTICES]
@@ -986,12 +1073,14 @@ def bench(dist=None):
 
 def main():
     global SPACING_M, SURVEY_ALT_M, SPEED_MPS, INSET_M, TARGET_QR, QR_ALIGN_EACH
-    global FOCUS_M, CAM_RES, SCAN_TILES
+    global FOCUS_M, CAM_RES, SCAN_TILES, EXPOSURE_EV, QR_DECODE_ALT_M
     global Picamera2, mavutil
     ap = argparse.ArgumentParser(description="Squadrone lawnmower survey with QR scan")
     ap.add_argument("--conn", default=SERIAL_PORT)
     ap.add_argument("--baud", type=int, default=BAUD_RATE)
     ap.add_argument("--plan-only", action="store_true")
+    ap.add_argument("--record", choices=list("ABCD"),
+                    help="stand the drone on that corner and save its GPS position")
     ap.add_argument("--bench", action="store_true")
     ap.add_argument("--spacing", type=float, default=SPACING_M)
     ap.add_argument("--alt", type=float, default=SURVEY_ALT_M)
@@ -1002,6 +1091,11 @@ def main():
     ap.add_argument("--dist", type=float, help="bench: camera-to-QR distance (m) to measure FOV")
     ap.add_argument("--models", help="folder with the WeChatQRCode model files")
     ap.add_argument("--no-wechat", action="store_true", help="use pyzbar only")
+    ap.add_argument("--decode-alt", type=float, default=None,
+                    help="allow descending to this altitude over a QR that won't read "
+                         "(off by default: rulebook requires 10 m)")
+    ap.add_argument("--ev", type=float, default=EXPOSURE_EV,
+                    help="exposure compensation (-2 darker .. +2 brighter), default -1 for glare")
     ap.add_argument("--focus-alt", action="store_true",
                     help="lock focus at the survey altitude (no AF hunting)")
     ap.add_argument("--res", help="camera resolution WxH, e.g. 4656x3496")
@@ -1020,6 +1114,12 @@ def main():
              f"align_each={QR_ALIGN_EACH}")
     log.info("=" * 60)
 
+    if a.record:
+        from pymavlink import mavutil as _m
+        mavutil = _m
+        record_corner(a.record, a.conn, a.baud)
+        return
+    load_corners()
     origin = POINT_A
     field, path = plan(origin)
     length = sum(math.dist(path[i][:2], path[i + 1][:2]) for i in range(len(path) - 1))
@@ -1037,6 +1137,8 @@ def main():
     from picamera2 import Picamera2 as _P
     Picamera2 = _P
     SCAN_TILES = a.tiles
+    EXPOSURE_EV = a.ev
+    QR_DECODE_ALT_M = a.decode_alt
     if a.focus_alt:
         FOCUS_M = a.dist if (a.bench and a.dist) else SURVEY_ALT_M
     if a.res:
@@ -1057,11 +1159,20 @@ def main():
     try:
         drone.wait_gps()
         xy = drone.xy()
+        dlat, dlon = xy_to_latlon(*xy, *origin)
+        g = drone.get("GPS_RAW_INT")
+        log.info(f"Drone GPS position: {dlat:.7f}, {dlon:.7f}   "
+                 f"(sats {g.satellites_visible if g else '?'}, "
+                 f"hdop {g.eph / 100 if g else 0:.2f})")
+        log.info(f"Corner A (recorded): {POINT_A[0]:.7f}, {POINT_A[1]:.7f}")
         log.info(f"Drone is {math.dist(xy, path[0][:2]):.1f} m from start point A, "
                  f"{dist_outside(*xy, field):.1f} m outside the field")
         log.info(f"FIRST MOVE after takeoff: {math.dist(xy, path[0][:2]):.1f} m towards "
                  f"{compass(bearing(xy, path[0][:2]))} — check this matches where A is!")
         log.info(f"Then pass 1: A → B towards {compass(bearing(path[0][:2], path[1][:2]))}")
+        if math.dist(xy, path[0][:2]) > WARN_START_DIST_M:
+            log.warning(f"  Starting {math.dist(xy, path[0][:2]):.0f} m from A — the drone "
+                        "will fly straight there first. Make sure that line is clear.")
         if math.dist(xy, path[0][:2]) > MAX_START_DIST_M:
             raise RuntimeError(f"More than {MAX_START_DIST_M:.0f} m from A — "
                                "move the drone near A first")
