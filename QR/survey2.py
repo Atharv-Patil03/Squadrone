@@ -108,7 +108,9 @@ CROP_DIR = os.path.expanduser("~/squadrone/qr_crops")
 # Camera (DOWN, ArduCam IMX519, rear, looking straight down)
 CAM_MODEL        = "imx519"
 CAM_RES          = (2328, 1748)   # --res 4656x3496 = full sensor (sharper, slower)
-FOCUS_M          = None           # None = continuous AF; --focus-alt locks it
+FOCUS_M          = 10.0           # lock focus at this distance (m); --focus-alt N; --af = continuous
+# At 10 m lock the depth of field is ~3 m .. infinity, so the 5 m reference/
+# delivery hover is sharp too. Continuous AF hunts over grass -> blur.
 PREVIEW_RES      = (640, 480)
 HFOV_DEG         = 66.0
 VFOV_DEG         = 51.0
@@ -517,6 +519,79 @@ class Reference:
                ("+ image" if self.crop is not None else "(no image)")
 
 
+# ── LENS FOCUS, set directly on the lens motor ──────────────────────────────
+# This Pi's libcamera tuning for the IMX519 has NO autofocus ("no AF
+# algorithm"), so AfMode / LensPosition are ignored. The lens motor (VCM)
+# driver still exposes `focus_absolute` on a /dev/v4l-subdev*, which v4l2-ctl
+# can set. --focus-sweep finds the sharpest value at 10 m and saves it here;
+# every camera start applies it.
+FOCUS_FILE = os.path.expanduser("~/squadrone/focus.json")
+FOCUS_VALUE = None          # --focus-value N overrides focus.json
+
+
+def _v4l2(args, timeout=3):
+    import subprocess
+    try:
+        r = subprocess.run(["v4l2-ctl"] + args, capture_output=True, text=True,
+                           timeout=timeout)
+        return r.returncode, r.stdout + r.stderr
+    except FileNotFoundError:
+        return 127, "v4l2-ctl not installed (sudo apt install v4l-utils)"
+    except Exception as e:
+        return 1, str(e)
+
+
+def find_lens():
+    """-> dict(dev, min, max, step, default, value) for the lens motor, or None."""
+    import glob, re
+    for dev in sorted(glob.glob("/dev/v4l-subdev*")):
+        rc, out = _v4l2(["-d", dev, "-l"])
+        m = re.search(r"focus_absolute.*?min=(-?\d+)\s+max=(-?\d+)\s+step=(\d+)\s+"
+                      r"default=(-?\d+)\s+value=(-?\d+)", out)
+        if m:
+            mn, mx, st, df, val = map(int, m.groups())
+            return {"dev": dev, "min": mn, "max": mx, "step": max(1, st),
+                    "default": df, "value": val}
+    return None
+
+
+def set_lens(lens, value):
+    v = int(max(lens["min"], min(lens["max"], value)))
+    rc, out = _v4l2(["-d", lens["dev"], "-c", f"focus_absolute={v}"])
+    if rc != 0:
+        log.warning(f"  lens: could not set focus_absolute={v}: {out.strip()[:120]}")
+        return None
+    return v
+
+
+def get_lens_value(lens):
+    import re
+    rc, out = _v4l2(["-d", lens["dev"], "-C", "focus_absolute"])
+    m = re.search(r"focus_absolute:\s*(-?\d+)", out)
+    return int(m.group(1)) if m else None
+
+
+def apply_saved_focus():
+    """Called after the camera starts. Returns a one-line description."""
+    lens = find_lens()
+    if lens is None:
+        return ("lens motor NOT found (no /dev/v4l-subdev with focus_absolute) — focus "
+                "is wherever the lens rests. Check: ls /dev/v4l-subdev*")
+    val, src = FOCUS_VALUE, "--focus-value"
+    if val is None and os.path.isfile(FOCUS_FILE):
+        with open(FOCUS_FILE) as f:
+            fj = json.load(f)
+        val, src = fj.get("focus_absolute"), (f"focus.json (swept at {fj.get('distance_m', '?')} m, "
+                                              f"{fj.get('date', '?')})")
+    if val is None:
+        return (f"lens on {lens['dev']} at its resting value {lens['value']} "
+                f"(range {lens['min']}..{lens['max']}) — NOT calibrated, run --focus-sweep")
+    got = set_lens(lens, val)
+    back = get_lens_value(lens)
+    return (f"lens focus_absolute={got} (read back {back}) on {lens['dev']} from {src}"
+            if got is not None else "lens focus could not be set")
+
+
 class SurveyCam(threading.Thread):
     """Captures high-res frames and scans for QRs. Every observation is queued
     with the frame time so the mission can use the drone pose AT THAT MOMENT."""
@@ -534,6 +609,8 @@ class SurveyCam(threading.Thread):
         self.ae_locked, self.gain, self.target_mean = False, 1.0, None
         self.t_open = self.t_gain = 0.0
         self.overlay = ""                 # mission writes alt/speed/phase here
+        self.focus_info = ""
+        self.scan_enabled = True
         self.n_saved = 0
 
     def open(self):
@@ -549,19 +626,44 @@ class SurveyCam(threading.Thread):
         self.cam.start()
         time.sleep(1.5)
         self.t_open = time.time()
-        focus = ({"AfMode": 0, "LensPosition": 1.0 / FOCUS_M} if FOCUS_M     # manual
-                 else {"AfMode": 2, "AfSpeed": 1})                          # continuous
-        for ctrl in ({"AwbEnable": True, "AwbMode": 5}, focus,
+        for ctrl in ({"AwbEnable": True, "AwbMode": 5},
                      {"AeExposureMode": 1},           # short exposure = less motion blur
                      {"ExposureValue": EXPOSURE_EV}): # glare: keep whites from blowing out
             try:
                 self.cam.set_controls(ctrl)
             except Exception as e:
                 log.warning(f"  camera control {list(ctrl)} not applied: {e}")
-        log.info(f"  Focus: {'fixed at %.1f m' % FOCUS_M if FOCUS_M else 'continuous AF'}")
+        self.focus_info = self._set_focus()
+        log.info(f"  Focus: {self.focus_info}")
         log.info(f"  Camera {CAM_MODEL} @ {CAM_RES}  "
                  f"(QR decoders: {'WeChat + ' if _wechat is not None else ''}"
                  f"{'pyzbar' if _HAVE_ZBAR else 'OpenCV'})")
+
+    def _set_focus(self):
+        """1) libcamera AF (AfMode advertised) -> lock LensPosition = 1/FOCUS_M,
+           2) else drive the lens motor directly (v4l2 focus_absolute)."""
+        has_af = "AfMode" in (getattr(self.cam, "camera_controls", {}) or {})
+        if FOCUS_VALUE is not None or not has_af:
+            why = "--focus-value given" if FOCUS_VALUE is not None else \
+                  "libcamera has NO AfMode for this camera"
+            return f"[direct lens] ({why}) " + apply_saved_focus()
+        try:
+            if FOCUS_M:
+                self.cam.set_controls({"AfMode": 0, "LensPosition": 1.0 / FOCUS_M})
+                want = f"LOCKED at {FOCUS_M:g} m (LensPosition {1.0 / FOCUS_M:.3f} dpt)"
+            else:
+                self.cam.set_controls({"AfMode": 2, "AfSpeed": 1})
+                want = "continuous AF"
+        except Exception as e:
+            return f"libcamera focus FAILED ({e}) -> [direct lens] " + apply_saved_focus()
+        time.sleep(0.6)
+        try:
+            lp = self.cam.capture_metadata().get("LensPosition")
+        except Exception:
+            lp = None
+        chk = "n/a" if lp is None else f"{lp:.3f} dpt (= {1 / lp:.1f} m)" if lp > 0.01 \
+            else f"{lp:.3f} dpt (infinity)"
+        return f"[libcamera AF] {want}; lens reports {chk}"
 
     def _shutter_control(self, md, small_gray):
         """Mini auto-exposure with a capped shutter: once AE wants a shutter
@@ -621,7 +723,7 @@ class SurveyCam(threading.Thread):
             self.md = md
             self._shutter_control(md, sg)
             t_scan = time.time()
-            qrs = scan_qr(frame)
+            qrs = scan_qr(frame) if self.scan_enabled else []
             if qrs:
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 for q in qrs:
@@ -1440,6 +1542,82 @@ def plan(origin):
     return field, build_lawnmower(A, B, C, D, SPACING_M)
 
 
+def focus_sweep(dist):
+    """Point the camera at a textured target `dist` m away (a QR on a wall, a
+    building, the far side of the field). Steps the lens through its range,
+    measures sharpness, saves the best value to focus.json + a plot."""
+    lens = find_lens()
+    if lens is None:
+        log.error("Lens motor not found. Run:  ls /dev/v4l-subdev*   and   "
+                  "for d in /dev/v4l-subdev*; do v4l2-ctl -d $d -l; done   — send me the output")
+        return
+    log.info(f"Lens motor: {lens['dev']}  focus_absolute range {lens['min']}..{lens['max']} "
+             f"(now {lens['value']})")
+    cam = SurveyCam()
+    cam.scan_enabled = False                  # sharpness only — fast
+    cam.open()
+    cam.start()
+    time.sleep(1.0)
+
+    def measure(v):
+        set_lens(lens, v)
+        time.sleep(0.35)                      # lens settles, flush old frames
+        vals, t0 = [], time.time()
+        while len(vals) < 3 and time.time() - t0 < 2:
+            vals.append(cam.sharp)
+            time.sleep(0.12)
+        return float(np.median(vals))
+
+    results = {}
+    try:
+        lo, hi = lens["min"], lens["max"]
+        coarse = np.linspace(lo, hi, 25).astype(int)
+        log.info(f"Coarse sweep ({len(coarse)} steps), keep the camera STILL…")
+        for v in coarse:
+            results[int(v)] = measure(v)
+            log.info(f"  focus {v:5d}  sharpness {results[int(v)]:8.1f}  "
+                     + "█" * int(40 * results[int(v)] / max(max(results.values()), 1)))
+        best = max(results, key=results.get)
+        step = max(lens["step"], int((hi - lo) / 24))
+        fine = np.linspace(max(lo, best - step), min(hi, best + step), 13).astype(int)
+        log.info(f"Fine sweep around {best}…")
+        for v in fine:
+            results[int(v)] = measure(v)
+        best = max(results, key=results.get)
+        set_lens(lens, best)
+    finally:
+        cam.stop()
+    ks = sorted(results)
+    peak, low = results[best], min(results.values())
+    log.info("\n══ FOCUS SWEEP RESULT ══")
+    for v in ks:
+        log.info(f"  focus {v:5d}  sharpness {results[v]:8.1f}  " +
+                 "█" * int(40 * results[v] / max(peak, 1)) + ("   ← BEST" if v == best else ""))
+    log.info(f"  Best focus_absolute = {best}  (sharpness {peak:.0f}, worst {low:.0f}, "
+             f"contrast ×{peak / max(low, 1):.1f})")
+    if peak < 1.5 * max(low, 1):
+        log.warning("  The curve is FLAT — the lens may not be moving, or the scene has no "
+                    "detail. Point at something textured and retry.")
+    # plot
+    W, H = 900, 360
+    img = np.full((H, W, 3), 30, np.uint8)
+    xs = lambda v: int(40 + (v - ks[0]) / max(1, ks[-1] - ks[0]) * (W - 80))
+    ys = lambda sv: int(H - 40 - sv / max(peak, 1) * (H - 80))
+    pts = np.array([(xs(v), ys(results[v])) for v in ks], np.int32)
+    cv2.polylines(img, [pts], False, (0, 220, 255), 2)
+    cv2.line(img, (xs(best), 20), (xs(best), H - 40), (0, 255, 0), 1)
+    cv2.putText(img, f"best {best}", (xs(best) + 5, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+    cv2.putText(img, f"focus sweep at {dist} m  (x: focus_absolute {ks[0]}..{ks[-1]}, y: sharpness)",
+                (40, H - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1)
+    cv2.imwrite(os.path.join(DEBUG_DIR, "focus_sweep.png"), img)
+    with open(FOCUS_FILE, "w") as f:
+        json.dump({"focus_absolute": int(best), "distance_m": dist, "device": lens["dev"],
+                   "sharpness": round(peak, 1), "date": time.strftime("%Y-%m-%d %H:%M"),
+                   "curve": {str(k): round(results[k], 1) for k in ks}}, f, indent=2)
+    log.info(f"  Saved {FOCUS_FILE} + {DEBUG_DIR}/focus_sweep.png — every camera start now "
+             f"uses focus_absolute={best}")
+
+
 def bench(dist=None, save_ref=False):
     """dist = distance camera->QR in metres (for FOV measurement + direction check).
     save_ref: store the QR in view as the start-QR reference.
@@ -1523,7 +1701,7 @@ def bench(dist=None, save_ref=False):
 
 def main():
     global SPACING_M, SURVEY_ALT_M, SPEED_MPS, INSET_M, TARGET_QR, QR_ALIGN_EACH
-    global FOCUS_M, CAM_RES, SCAN_TILES, EXPOSURE_EV, QR_DECODE_ALT_M
+    global FOCUS_M, FOCUS_VALUE, CAM_RES, SCAN_TILES, EXPOSURE_EV, QR_DECODE_ALT_M
     global Picamera2, mavutil
     global MATCH_MODE, IMAGE_MATCH_THRESHOLD, REF_ALT_M, DELIVERY_ALT_M
     global MAX_SHUTTER_US, QR_DWELL_S
@@ -1558,10 +1736,14 @@ def main():
                          "(off by default: rulebook requires 10 m)")
     ap.add_argument("--ev", type=float, default=EXPOSURE_EV,
                     help="exposure compensation (-2 darker .. +2 brighter), default -1 for glare")
-    ap.add_argument("--focus-alt", action="store_true",
-                    help="lock focus at the survey altitude (no AF hunting)")
+    ap.add_argument("--focus-alt", type=float, nargs="?", const=SURVEY_ALT_M, default=FOCUS_M,
+                    help=f"lock focus at N metres (default {FOCUS_M:g}; bare flag = survey alt)")
+    ap.add_argument("--af", action="store_true", help="continuous autofocus instead of a lock")
     ap.add_argument("--res", help="camera resolution WxH, e.g. 4656x3496")
     ap.add_argument("--tiles", type=int, default=SCAN_TILES, help="tile grid N (0 = off)")
+    ap.add_argument("--focus-sweep", action="store_true",
+                    help="ground: find the sharpest lens position at --dist m (default 10)")
+    ap.add_argument("--focus-value", type=int, help="set the lens focus_absolute directly")
     ap.add_argument("--shutter-us", type=int, default=MAX_SHUTTER_US,
                     help="max shutter time in microseconds (0 = fully automatic)")
     ap.add_argument("--dwell", type=float, default=QR_DWELL_S,
@@ -1610,12 +1792,15 @@ def main():
     MAX_SHUTTER_US, QR_DWELL_S = a.shutter_us, a.dwell
     EXPOSURE_EV = a.ev
     QR_DECODE_ALT_M = a.decode_alt
-    if a.focus_alt:
-        FOCUS_M = a.dist if (a.bench and a.dist) else SURVEY_ALT_M
+    FOCUS_M = None if a.af else a.focus_alt
     if a.res:
         CAM_RES = tuple(int(v) for v in a.res.lower().split("x"))
     if not a.no_wechat:
         load_wechat(a.models)
+    FOCUS_VALUE = a.focus_value
+    if a.focus_sweep:
+        focus_sweep(a.dist or 10.0)
+        return
     if a.bench:
         bench(a.dist, a.save_ref)
         return
