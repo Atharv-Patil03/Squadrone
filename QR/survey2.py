@@ -15,9 +15,11 @@ WHAT IT DOES
         both have text -> text decides;  otherwise -> image similarity
         (best of 4 rotations, normalised correlation, threshold 0.60).
   3. After the survey: fly to the best-matching QR, descend to DELIVERY_ALT_M
-     (5 m), centre on it, hover HOVER_S. Then RTL home.
-  Results: survey_results.json (match + scores per QR), survey_map.png,
-  qr_crops/qrN.png (what each QR looked like) next to reference_qr.png.
+     (5 m), centre on it and ASK the operator to confirm (drone holds position
+     while waiting): 'yes' -> RTL home; 'no' -> next candidate (or RTL).
+  Results (~/squadrone): survey.log, survey_results.json (match + scores per
+  QR), survey_map.png, match_report.png (start QR next to every QR with its
+  score/verdict), qr_crops/qrN.png, reference_qr.png, TIMING per phase in the log.
   SAFETY: >3 m outside the field (after reaching A) = automatic RTL. Mode
   change by the pilot (e.g. Loiter) = script stops immediately.
 
@@ -115,6 +117,15 @@ CAM_OFFSET_FWD_M = -0.10          # camera behind drone centre
 # track (and the banner drifting back) = forward/back was reversed.
 FLIP_X, FLIP_Y   = False, True
 MAX_TILT_DEG     = 10.0
+# Motion blur: the drone no longer stops over QRs, so frames are taken while
+# moving. Cap the shutter time (brightness kept with sensor gain instead).
+#   blur (pixels) = speed x shutter / mm-per-pixel:  1.5 m/s x 1 ms = 1.5 mm
+#   = 0.3 px at 10 m (sharp);  x 10 ms = 2.7 px (soft QR modules)
+MAX_SHUTTER_US   = 1000           # 0 = leave exposure fully automatic
+MAX_GAIN         = 16.0
+QR_DWELL_S       = 2.0            # pause this long when a NEW QR appears (sharp frames)
+FRAME_EVERY_S    = 2.0            # save a flight frame this often (diagnostics)
+MAX_SAVED_FRAMES = 400
 
 SERIAL_PORT = "/dev/ttyAMA0"
 BAUD_RATE   = 921600
@@ -122,6 +133,7 @@ EARTH_R     = 6_378_137.0
 
 DEBUG_DIR = os.path.expanduser("~/squadrone")
 os.makedirs(DEBUG_DIR, exist_ok=True)
+FRAME_DIR = os.path.join(DEBUG_DIR, "flight_frames")
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s",
                     handlers=[logging.StreamHandler(sys.stdout),
@@ -518,6 +530,11 @@ class SurveyCam(threading.Thread):
         self.fps = 0.0
         self.scan_ms = 0.0
         self._stop_evt = threading.Event()
+        self.sharp, self.md = 0.0, {}
+        self.ae_locked, self.gain, self.target_mean = False, 1.0, None
+        self.t_open = self.t_gain = 0.0
+        self.overlay = ""                 # mission writes alt/speed/phase here
+        self.n_saved = 0
 
     def open(self):
         info = Picamera2.global_camera_info()
@@ -531,6 +548,7 @@ class SurveyCam(threading.Thread):
         self.cam.configure(cfg)
         self.cam.start()
         time.sleep(1.5)
+        self.t_open = time.time()
         focus = ({"AfMode": 0, "LensPosition": 1.0 / FOCUS_M} if FOCUS_M     # manual
                  else {"AfMode": 2, "AfSpeed": 1})                          # continuous
         for ctrl in ({"AwbEnable": True, "AwbMode": 5}, focus,
@@ -545,16 +563,63 @@ class SurveyCam(threading.Thread):
                  f"(QR decoders: {'WeChat + ' if _wechat is not None else ''}"
                  f"{'pyzbar' if _HAVE_ZBAR else 'OpenCV'})")
 
+    def _shutter_control(self, md, small_gray):
+        """Mini auto-exposure with a capped shutter: once AE wants a shutter
+        longer than MAX_SHUTTER_US, take over: fixed short shutter, and keep
+        the image brightness where it was by adjusting gain once a second."""
+        if not MAX_SHUTTER_US:
+            return
+        md = md or {}
+        now = time.time()
+        exp, gain = md.get("ExposureTime"), md.get("AnalogueGain")
+        mean = float(small_gray.mean())
+        if not self.ae_locked:
+            if exp and gain and exp > MAX_SHUTTER_US and now - self.t_open > 1.5:
+                self.gain = float(min(MAX_GAIN, gain * exp / MAX_SHUTTER_US))
+                self.target_mean = mean
+                try:
+                    self.cam.set_controls({"AeEnable": False,
+                                           "ExposureTime": int(MAX_SHUTTER_US),
+                                           "AnalogueGain": self.gain})
+                    self.ae_locked = True
+                    log.info(f"  Shutter capped: AE wanted {exp} us x{gain:.1f} → "
+                             f"{MAX_SHUTTER_US} us x{self.gain:.1f} (target brightness "
+                             f"{mean:.0f})")
+                except Exception as e:
+                    log.warning(f"  could not cap shutter: {e}")
+                    self.ae_locked = None          # don't try again
+            return
+        if self.ae_locked and now - self.t_gain > 1.0 and mean > 1:
+            self.t_gain = now
+            new = float(min(MAX_GAIN, max(1.0, self.gain * (self.target_mean / mean) ** 0.5)))
+            if abs(new - self.gain) / self.gain > 0.05:
+                self.gain = new
+                try:
+                    self.cam.set_controls({"AnalogueGain": self.gain})
+                except Exception:
+                    pass
+
     def run(self):
         n, t0 = 0, time.time()
+        t_diag = t_frame = 0.0
         while not self._stop_evt.is_set():
             try:
-                frame = self.cam.capture_array()        # BGR order already
+                req = self.cam.capture_request()
+                try:
+                    frame = req.make_array("main")          # BGR order already
+                    md = req.get_metadata()
+                finally:
+                    req.release()
             except Exception as e:
                 log.warning(f"  capture: {e}")
                 time.sleep(0.2)
                 continue
             t = time.time()
+            small = cv2.resize(frame, PREVIEW_RES, interpolation=cv2.INTER_AREA)
+            sg = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+            self.sharp = float(cv2.Laplacian(sg, cv2.CV_64F).var())   # blur meter
+            self.md = md
+            self._shutter_control(md, sg)
             t_scan = time.time()
             qrs = scan_qr(frame)
             if qrs:
@@ -565,14 +630,35 @@ class SurveyCam(threading.Thread):
                         q["area"] = float(cv2.contourArea(
                             np.asarray(q["quad"], np.float32).reshape(-1, 2)))
             self.scan_ms = (time.time() - t_scan) * 1000
-            o = {"t": t, "qrs": qrs, "w": frame.shape[1], "h": frame.shape[0]}
-            small = cv2.resize(frame, PREVIEW_RES, interpolation=cv2.INTER_AREA)
+            o = {"t": t, "qrs": qrs, "w": frame.shape[1], "h": frame.shape[0],
+                 "sharp": self.sharp}
             with self.lk:
                 self.obs.append(o)
                 self.preview = (small, qrs, frame.shape[1] / PREVIEW_RES[0])
             n += 1
             if t - t0 > 2:
                 self.fps, n, t0 = n / (t - t0), 0, t
+            if t - t_diag >= 2.0:                  # camera health line
+                t_diag = t
+                log.info(f"  [cam] fps {self.fps:.1f}  scan {self.scan_ms:.0f} ms  "
+                         f"sharpness {self.sharp:.0f}  shutter {md.get('ExposureTime', '?')} us  "
+                         f"gain {md.get('AnalogueGain', 0):.1f}  "
+                         f"lens {md.get('LensPosition', 'n/a')}  QRs {len(qrs)}  "
+                         f"| {self.overlay}")
+            if FRAME_EVERY_S and t - t_frame >= FRAME_EVERY_S and self.n_saved < MAX_SAVED_FRAMES:
+                t_frame = t
+                fr = cv2.resize(frame, (frame.shape[1] // 2, frame.shape[0] // 2),
+                                interpolation=cv2.INTER_AREA)
+                for q in qrs:
+                    cv2.polylines(fr, [(np.asarray(q["quad"]) / 2).astype(np.int32)], True,
+                                  (0, 255, 0) if q["text"] else (0, 200, 255), 3)
+                cv2.putText(fr, f"sharp {self.sharp:.0f}  shutter {md.get('ExposureTime', '?')}us "
+                                f"gain {md.get('AnalogueGain', 0):.1f}  {self.overlay}",
+                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                os.makedirs(FRAME_DIR, exist_ok=True)
+                cv2.imwrite(os.path.join(FRAME_DIR, f"f{self.n_saved:04d}.jpg"), fr,
+                            [cv2.IMWRITE_JPEG_QUALITY, 80])
+                self.n_saved += 1
 
     def drain(self):
         with self.lk:
@@ -874,6 +960,9 @@ class Survey:
         start_out = dist_outside(*xy, field) if xy else 0.0
         self.fence_m = max(GEOFENCE_MARGIN_M, start_out + 2.0)
         self.ref = Reference()
+        self.phases = []          # [name, start, end] — timing summary
+        self.dwell_until, self.dwell_xy, self.no_dwell = 0.0, None, False
+        self.confirmed = None
 
     # ── camera observations → QR registry ────────────────────────────────
     def process(self):
@@ -896,7 +985,12 @@ class Survey:
                 if self.ref.xy and math.dist((qx, qy), self.ref.xy) < REF_EXCLUDE_M:
                     continue                      # that's the start QR itself
                 if point_in_poly(qx, qy, self.field):
-                    rec, _ = self.reg.add(q["text"], qx, qy)
+                    rec, is_new = self.reg.add(q["text"], qx, qy)
+                    if is_new and QR_DWELL_S and not self.no_dwell:
+                        self.dwell_until = time.time() + QR_DWELL_S
+                        self.dwell_xy = (x, y)
+                        log.info(f"    pausing {QR_DWELL_S:.0f} s for sharp frames of QR "
+                                 f"#{rec.id} (sharpness now {o.get('sharp', 0):.0f})")
                     rec.last_seen = o["t"]
                     rec.last_off = math.hypot(e, n)
                     self.judge(rec, q, alt)
@@ -922,6 +1016,8 @@ class Survey:
 
     def tick(self, status):
         self.status = status
+        a = self.d.alt()
+        self.cam.overlay = f"alt {a or 0:.1f} m  {status[:60]}"
         self.process()
         now = time.time()
         xy = self.d.xy()
@@ -980,6 +1076,10 @@ class Survey:
                     self.visit_qr(q)
                     continue
             cur = self.d.xy()
+            if handle_qr and time.time() < self.dwell_until and self.dwell_xy:
+                self.d.goto_xy(self.dwell_xy[0], self.dwell_xy[1], alt, self.yaw)
+                self.tick(f"dwell {self.dwell_until - time.time():.1f} s (sharp frames)")
+                continue
             dist = math.dist(cur, target)
             if dist < accept:
                 return True
@@ -1042,6 +1142,7 @@ class Survey:
     # ── start QR ─────────────────────────────────────────────────────────
     def capture_reference(self, home):
         """Hover at REF_ALT_M over the takeoff spot and store the start QR."""
+        self.phase("read start QR (5 m)")
         log.info(f"\n══ READING START QR at {REF_ALT_M:.0f} m ══")
         seen = []
         t0 = time.time()
@@ -1081,38 +1182,128 @@ class Survey:
         return True
 
     # ── delivery ─────────────────────────────────────────────────────────
+    def ask_holding(self, xy, alt, prompt):
+        """Ask the operator while a background thread keeps the drone on the
+        spot (input() blocks the main loop)."""
+        stop = threading.Event()
+
+        def keep():
+            while not stop.is_set():
+                if self.d.mode() == "GUIDED":
+                    self.d.goto_xy(xy[0], xy[1], alt, self.yaw)
+                time.sleep(0.5)
+        threading.Thread(target=keep, daemon=True).start()
+        try:
+            ans = input(prompt).strip().lower()
+        finally:
+            stop.set()
+        self.d.check()
+        return ans
+
     def deliver(self):
-        """Go to the best-matching QR, descend to DELIVERY_ALT_M, centre, hover."""
+        """Go to the best-matching QR, descend to DELIVERY_ALT_M, centre, then ASK
+        the operator to confirm. Returns True when confirmed (caller RTLs)."""
+        self.no_dwell = True
         cands = [q for q in self.reg.items if not q.rejected and q.verdict()[0]]
         cands.sort(key=lambda q: q.score(), reverse=True)
         if not cands:
-            log.warning("  ✗ No QR matched the start QR — nothing to deliver to")
+            log.warning("  ✗ No QR matched the start QR — RTL")
             return False
-        for q in cands:
+        log.info(f"  Candidates (best first): " + ", ".join(
+            f"#{q.id} {q.verdict()[1]}" for q in cands))
+        for i, q in enumerate(cands):
+            self.phase(f"descend to match #{q.id}")
             log.info(f"\n══ MATCH: QR #{q.id} ({q.verdict()[1]}) — descending to "
                      f"{DELIVERY_ALT_M:.0f} m ══")
             q.aligned, q.visits = False, 0
             n_low = len(q.sims_low)
             ok = self.visit_qr(q, alt=DELIVERY_ALT_M, need_text=False, climb_back=False)
             low = q.sims_low[n_low:]
+            close = f"{np.median(low):.2f}" if low else "n/a"
             if low and float(np.median(low)) < IMAGE_MATCH_THRESHOLD:
-                # informational only — the survey verdict (many looks) decides
-                log.warning(f"    Close-up image score {np.median(low):.2f} is below the "
-                            f"threshold — check ~/squadrone/qr_crops/qr{q.id}.png after landing")
-            if ok:
-                log.info(f"    ✓ Over the matching QR at {self.d.alt() or 0:.1f} m"
-                         + (f" (close-up image {np.median(low):.2f})" if low else ""))
-                t_h = time.time()
-                while time.time() - t_h < HOVER_S:
-                    self.d.check()
-                    self.d.goto_xy(q.x, q.y, DELIVERY_ALT_M, self.yaw)
-                    self.tick(f"HOVER over match {time.time() - t_h:.0f}/{HOVER_S} s")
+                log.warning(f"    Close-up image score {close} is below the threshold "
+                            f"{IMAGE_MATCH_THRESHOLD} — look at the match report before confirming")
+            log.info(f"    {'✓ Centred' if ok else '⚠ NOT centred'} over QR #{q.id} at "
+                     f"{self.d.alt() or 0:.1f} m | survey score {q.verdict()[1]} | "
+                     f"close-up {close} | offset {getattr(q, 'last_off', 0):.2f} m")
+            self.match_report(highlight=q.id)
+            more = i + 1 < len(cands)
+            self.phase(f"operator confirm #{q.id}")
+            while True:
+                ans = self.ask_holding(
+                    (q.x, q.y), DELIVERY_ALT_M,
+                    f"\n>>> Over QR #{q.id} at {self.d.alt() or 0:.1f} m "
+                    f"(score {q.verdict()[1]}, close-up {close}). "
+                    f"CONFIRM this is the match? 'yes' = confirm + RTL"
+                    + (", 'no' = try next candidate" if more else ", 'no' = RTL")
+                    + ": ")
+                if ans in ("yes", "no"):
+                    break
+                print("  type yes or no")
+            if ans == "yes":
+                log.info(f"  ✓ Operator CONFIRMED QR #{q.id} as the match")
+                self.confirmed = q
                 return True
-        log.warning("  Could not confirm any candidate")
+            log.info(f"  ✗ Operator rejected QR #{q.id}")
+            if more:
+                self.wait_alt(q.x, q.y, SURVEY_ALT_M)
+        log.warning("  No candidate confirmed — RTL")
         return False
+
+    # ── analytics ────────────────────────────────────────────────────────
+    def phase(self, name):
+        """Mark the start of a mission phase (timing summary at the end)."""
+        now = time.time()
+        if self.phases:
+            self.phases[-1][2] = now
+        self.phases.append([name, now, None])
+
+    def phase_summary(self):
+        if not self.phases:
+            return
+        self.phases[-1][2] = self.phases[-1][2] or time.time()
+        log.info("\n══ TIMING ══")
+        for name, t0, t1 in self.phases:
+            log.info(f"  {name:28s} {t1 - t0:6.1f} s")
+        log.info(f"  {'TOTAL':28s} {self.phases[-1][2] - self.phases[0][1]:6.1f} s")
+
+    def match_report(self, highlight=None):
+        """One image: start QR + every field QR crop with its score and verdict.
+        ~/squadrone/match_report.png — open it to see WHY something matched."""
+        tiles = []
+        def tile(img, lines, col):
+            t = np.full((CROP_SIZE + 64, CROP_SIZE + 10, 3), 30, np.uint8)
+            if img is not None:
+                t[5:5 + CROP_SIZE, 5:5 + CROP_SIZE] = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+            else:
+                cv2.putText(t, "no image", (55, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (120, 120, 120), 1)
+            cv2.rectangle(t, (2, 2), (t.shape[1] - 3, CROP_SIZE + 8), col, 3)
+            for k, ln in enumerate(lines):
+                cv2.putText(t, ln[:26], (6, CROP_SIZE + 26 + 18 * k), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.45, col, 1, cv2.LINE_AA)
+            return t
+        tiles.append(tile(self.ref.crop, ["START QR (reference)",
+                                          f"text={self.ref.text!r}"[:26]], (255, 255, 255)))
+        for q in self.reg.items:
+            if q.rejected:
+                continue
+            v, why = q.verdict()
+            col = (0, 220, 0) if v else ((0, 0, 230) if v is False else (0, 200, 255))
+            if q.id == highlight:
+                col = (255, 200, 0)
+            tag = "MATCH" if v else ("no match" if v is False else "undecided")
+            tiles.append(tile(q.best_crop, [f"QR #{q.id}  {tag}", f"{why}  ({q.n} looks)"], col))
+        cols = 4
+        rows = [tiles[i:i + cols] for i in range(0, len(tiles), cols)]
+        blank = np.full_like(tiles[0], 30)
+        img = np.vstack([np.hstack(r + [blank] * (cols - len(r))) for r in rows])
+        path = os.path.join(DEBUG_DIR, "match_report.png")
+        cv2.imwrite(path, img)
+        log.info(f"  Match report: {path}")
 
     # ── main flow ────────────────────────────────────────────────────────
     def run(self, target_text=None):
+        self.phase("survey (10 m lawnmower)")
         prev = self.d.xy()
         for i, (x, y, lab) in enumerate(self.path, 1):
             yaw = bearing(prev, (x, y)) if math.dist(prev, (x, y)) > 1 else self.yaw
@@ -1138,9 +1329,14 @@ class Survey:
                 log.info(f"  QR #{q.id}: text={q.text!r:<28} {lat:.7f}, {lon:.7f}  "
                          f"{tag:9s} ({why}, {q.n} looks)")
         self.save()
+        self.match_report()
 
         if target_text is None and self.ref.ready():
-            self.deliver()
+            try:
+                self.deliver()
+            finally:
+                self.phase("RTL")
+                self.phase_summary()
             return
         if target_text:
             q = self.reg.find(target_text)
@@ -1330,6 +1526,7 @@ def main():
     global FOCUS_M, CAM_RES, SCAN_TILES, EXPOSURE_EV, QR_DECODE_ALT_M
     global Picamera2, mavutil
     global MATCH_MODE, IMAGE_MATCH_THRESHOLD, REF_ALT_M, DELIVERY_ALT_M
+    global MAX_SHUTTER_US, QR_DWELL_S
     ap = argparse.ArgumentParser(description="Squadrone lawnmower survey with QR scan")
     ap.add_argument("--conn", default=SERIAL_PORT)
     ap.add_argument("--baud", type=int, default=BAUD_RATE)
@@ -1365,6 +1562,10 @@ def main():
                     help="lock focus at the survey altitude (no AF hunting)")
     ap.add_argument("--res", help="camera resolution WxH, e.g. 4656x3496")
     ap.add_argument("--tiles", type=int, default=SCAN_TILES, help="tile grid N (0 = off)")
+    ap.add_argument("--shutter-us", type=int, default=MAX_SHUTTER_US,
+                    help="max shutter time in microseconds (0 = fully automatic)")
+    ap.add_argument("--dwell", type=float, default=QR_DWELL_S,
+                    help="pause this many seconds when a new QR appears (0 = never)")
     a = ap.parse_args()
     if not (1 <= a.spacing <= 30 and 3 <= a.alt <= 30 and 0.5 <= a.speed <= 5
             and 0 <= a.inset <= 5):
@@ -1406,6 +1607,7 @@ def main():
     from picamera2 import Picamera2 as _P
     Picamera2 = _P
     SCAN_TILES = a.tiles
+    MAX_SHUTTER_US, QR_DWELL_S = a.shutter_us, a.dwell
     EXPOSURE_EV = a.ev
     QR_DECODE_ALT_M = a.decode_alt
     if a.focus_alt:
@@ -1457,6 +1659,7 @@ def main():
             log.info(f"  Start QR from file: {sv.ref.describe()}")
         else:
             log.warning("  --ref saved but no saved reference — survey will only LOG QRs")
+        sv.phase("climb to survey alt")
         sv.wait_alt(home[0], home[1], SURVEY_ALT_M)
         sv.run(TARGET_QR)
         log.info("\n✓ Done — RTL")
