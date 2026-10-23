@@ -108,9 +108,22 @@ CROP_DIR = os.path.expanduser("~/squadrone/qr_crops")
 # Camera (DOWN, ArduCam IMX519, rear, looking straight down)
 CAM_MODEL        = "imx519"
 CAM_RES          = (2328, 1748)   # --res 4656x3496 = full sensor (sharper, slower)
-FOCUS_M          = 10.0           # lock focus at this distance (m); --focus-alt N; --af = continuous
-# At 10 m lock the depth of field is ~3 m .. infinity, so the 5 m reference/
-# delivery hover is sharp too. Continuous AF hunts over grass -> blur.
+# ── PAYLOAD (same servos as payload_test.py, field-verified) ──────────────────
+# SERVO5_FUNCTION and SERVO6_FUNCTION must be 0 so DO_SET_SERVO controls them.
+PAYLOAD          = True      # --no-payload: confirm + RTL only
+LATCH_SERVO      = 6
+LATCH_CLOSED_PWM = 2000      # field-tested values (your payload_test.py)
+LATCH_OPEN_PWM   = 1000
+LATCH_WAIT_S     = 2.0
+WINCH_SERVO      = 5
+WINCH_STOP_PWM   = 1500
+WINCH_UNWIND_PWM = 1000      # lowers the payload
+WINCH_REWIND_PWM = 2000      # pulls it back up
+UNWIND_S         = 40.0
+REWIND_BEFORE_RTL = False    # --rewind: wind the line back up before RTL
+
+FOCUS_M          = None           # None = continuous AF (field-proven clear feed, 23-10)
+                                  # --focus-alt N locks the lens at N m (was blurry 23-10)
 PREVIEW_RES      = (640, 480)
 HFOV_DEG         = 66.0
 VFOV_DEG         = 51.0
@@ -123,7 +136,8 @@ MAX_TILT_DEG     = 10.0
 # moving. Cap the shutter time (brightness kept with sensor gain instead).
 #   blur (pixels) = speed x shutter / mm-per-pixel:  1.5 m/s x 1 ms = 1.5 mm
 #   = 0.3 px at 10 m (sharp);  x 10 ms = 2.7 px (soft QR modules)
-MAX_SHUTTER_US   = 1000           # 0 = leave exposure fully automatic
+MAX_SHUTTER_US   = 0              # 0 = fully automatic exposure (like the clear-feed
+                                  # script). --shutter-us 1000 = old capped shutter
 MAX_GAIN         = 16.0
 QR_DWELL_S       = 2.0            # pause this long when a NEW QR appears (sharp frames)
 FRAME_EVERY_S    = 2.0            # save a flight frame this often (diagnostics)
@@ -592,6 +606,18 @@ def apply_saved_focus():
             if got is not None else "lens focus could not be set")
 
 
+_AF_STATES = {0: "idle", 1: "scanning", 2: "FOCUSED", 3: "FAILED"}
+
+
+def _lens_txt(md):
+    """'0.112dpt≈8.9m FOCUSED' — shows what autofocus is doing in every [cam] line."""
+    lp, st = md.get("LensPosition"), md.get("AfState")
+    if lp is None:
+        return "n/a (lens not controlled!)"
+    dist = "inf" if lp < 0.02 else f"{1 / lp:.1f}m"
+    return f"{lp:.3f}dpt≈{dist} {_AF_STATES.get(st, st) if st is not None else ''}".strip()
+
+
 class SurveyCam(threading.Thread):
     """Captures high-res frames and scans for QRs. Every observation is queued
     with the frame time so the mission can use the drone pose AT THAT MOMENT."""
@@ -745,7 +771,7 @@ class SurveyCam(threading.Thread):
                 log.info(f"  [cam] fps {self.fps:.1f}  scan {self.scan_ms:.0f} ms  "
                          f"sharpness {self.sharp:.0f}  shutter {md.get('ExposureTime', '?')} us  "
                          f"gain {md.get('AnalogueGain', 0):.1f}  "
-                         f"lens {md.get('LensPosition', 'n/a')}  QRs {len(qrs)}  "
+                         f"lens {_lens_txt(md)}  QRs {len(qrs)}  "
                          f"| {self.overlay}")
             if FRAME_EVERY_S and t - t_frame >= FRAME_EVERY_S and self.n_saved < MAX_SAVED_FRAMES:
                 t_frame = t
@@ -843,6 +869,9 @@ class Drone:
                     self.poses.append((time.time(), x, y, m.relative_alt / 1000.0, yaw, tilt))
             if t == "STATUSTEXT":
                 log.info(f"  [FC] {m.text}")
+            if t == "COMMAND_ACK":
+                with self.lk:
+                    self.state[f"_ack_{m.command}"] = (m.result, time.time())
 
     def get(self, t):
         with self.lk:
@@ -899,6 +928,25 @@ class Drone:
         p = list(p) + [0] * (7 - len(p))
         self.mav.mav.command_long_send(self.mav.target_system, self.mav.target_component,
                                        c, 0, *p)
+
+    def servo(self, num, pwm, label=""):
+        """MAV_CMD_DO_SET_SERVO, retried until the FC acknowledges it."""
+        L = mavutil.mavlink
+        for attempt in range(5):
+            t_send = time.time()
+            self.cmd(L.MAV_CMD_DO_SET_SERVO, num, pwm)
+            while time.time() - t_send < 0.6:
+                ack = self.get(f"_ack_{L.MAV_CMD_DO_SET_SERVO}")
+                if ack and ack[1] >= t_send:
+                    if ack[0] == L.MAV_RESULT_ACCEPTED:
+                        log.info(f"  SERVO{num} = {pwm} us  {label}  ✓")
+                        return True
+                    log.error(f"  SERVO{num} = {pwm} REJECTED by FC (result {ack[0]}) — "
+                              f"is SERVO{num}_FUNCTION = 0?")
+                    return False
+                time.sleep(0.05)
+        log.warning(f"  SERVO{num} = {pwm} sent, but NO acknowledgement from the FC")
+        return False
 
     def set_param(self, name, value):
         self.mav.mav.param_set_send(self.mav.target_system, self.mav.target_component,
@@ -1065,6 +1113,7 @@ class Survey:
         self.phases = []          # [name, start, end] — timing summary
         self.dwell_until, self.dwell_xy, self.no_dwell = 0.0, None, False
         self.confirmed = None
+        self.payload_log, self.payload_done, self.winch_running = [], False, False
 
     # ── camera observations → QR registry ────────────────────────────────
     def process(self):
@@ -1302,6 +1351,51 @@ class Survey:
         self.d.check()
         return ans
 
+    def hold(self, xy, alt, seconds, label):
+        """Stay on the spot for `seconds`, logging alt + drift every 2 s."""
+        t0, t_log, drift = time.time(), 0, []
+        while time.time() - t0 < seconds:
+            self.d.check()
+            self.d.goto_xy(xy[0], xy[1], alt, self.yaw)
+            p = self.d.xy()
+            if p:
+                drift.append(math.dist(p, xy))
+            if time.time() - t_log >= 2:
+                log.info(f"    {label} {time.time() - t0:4.0f}/{seconds:.0f} s   "
+                         f"alt {self.d.alt() or 0:.1f} m   off-spot {drift[-1] if drift else 0:.1f} m")
+                t_log = time.time()
+            time.sleep(0.2)
+        return max(drift) if drift else 0.0
+
+    def drop_payload(self, q):
+        """Unlatch, then unwind the winch for UNWIND_S while holding over the QR."""
+        xy, alt = (q.x, q.y), DELIVERY_ALT_M
+        self.phase("payload: unlatch")
+        log.info(f"\n══ PAYLOAD over QR #{q.id} at {self.d.alt() or 0:.1f} m ══")
+        log.info(f"  UNLATCH: SERVO{LATCH_SERVO} = {LATCH_OPEN_PWM}")
+        self.payload_log.append(("latch open", self.d.servo(LATCH_SERVO, LATCH_OPEN_PWM, "latch OPEN")))
+        self.hold(xy, alt, LATCH_WAIT_S, "latch opening")
+        self.phase(f"payload: unwind {UNWIND_S:.0f} s")
+        log.info(f"  UNWIND: SERVO{WINCH_SERVO} = {WINCH_UNWIND_PWM} for {UNWIND_S:.0f} s")
+        self.payload_log.append(("winch unwind", self.d.servo(WINCH_SERVO, WINCH_UNWIND_PWM, "UNWIND")))
+        self.winch_running = True
+        try:
+            worst = self.hold(xy, alt, UNWIND_S, "unwinding")
+        finally:
+            self.payload_log.append(("winch stop", self.d.servo(WINCH_SERVO, WINCH_STOP_PWM, "winch STOP")))
+            self.winch_running = False
+        log.info(f"  ✓ Payload lowered (max drift while unwinding {worst:.1f} m)")
+        if REWIND_BEFORE_RTL:
+            self.phase(f"payload: rewind {UNWIND_S:.0f} s")
+            self.payload_log.append(("winch rewind", self.d.servo(WINCH_SERVO, WINCH_REWIND_PWM, "REWIND")))
+            self.winch_running = True
+            try:
+                self.hold(xy, alt, UNWIND_S, "rewinding")
+            finally:
+                self.payload_log.append(("winch stop", self.d.servo(WINCH_SERVO, WINCH_STOP_PWM, "winch STOP")))
+                self.winch_running = False
+        self.payload_done = True
+
     def deliver(self):
         """Go to the best-matching QR, descend to DELIVERY_ALT_M, centre, then ASK
         the operator to confirm. Returns True when confirmed (caller RTLs)."""
@@ -1336,7 +1430,9 @@ class Survey:
                     (q.x, q.y), DELIVERY_ALT_M,
                     f"\n>>> Over QR #{q.id} at {self.d.alt() or 0:.1f} m "
                     f"(score {q.verdict()[1]}, close-up {close}). "
-                    f"CONFIRM this is the match? 'yes' = confirm + RTL"
+                    f"CONFIRM this is the match? 'yes' = "
+                    + (f"DROP PAYLOAD (unlatch + unwind {UNWIND_S:.0f} s) then RTL"
+                       if PAYLOAD else "confirm + RTL")
                     + (", 'no' = try next candidate" if more else ", 'no' = RTL")
                     + ": ")
                 if ans in ("yes", "no"):
@@ -1345,6 +1441,8 @@ class Survey:
             if ans == "yes":
                 log.info(f"  ✓ Operator CONFIRMED QR #{q.id} as the match")
                 self.confirmed = q
+                if PAYLOAD:
+                    self.drop_payload(q)
                 return True
             log.info(f"  ✗ Operator rejected QR #{q.id}")
             if more:
@@ -1701,6 +1799,7 @@ def bench(dist=None, save_ref=False):
 
 def main():
     global SPACING_M, SURVEY_ALT_M, SPEED_MPS, INSET_M, TARGET_QR, QR_ALIGN_EACH
+    global PAYLOAD, UNWIND_S, REWIND_BEFORE_RTL
     global FOCUS_M, FOCUS_VALUE, CAM_RES, SCAN_TILES, EXPOSURE_EV, QR_DECODE_ALT_M
     global Picamera2, mavutil
     global MATCH_MODE, IMAGE_MATCH_THRESHOLD, REF_ALT_M, DELIVERY_ALT_M
@@ -1736,9 +1835,12 @@ def main():
                          "(off by default: rulebook requires 10 m)")
     ap.add_argument("--ev", type=float, default=EXPOSURE_EV,
                     help="exposure compensation (-2 darker .. +2 brighter), default -1 for glare")
-    ap.add_argument("--focus-alt", type=float, nargs="?", const=SURVEY_ALT_M, default=FOCUS_M,
-                    help=f"lock focus at N metres (default {FOCUS_M:g}; bare flag = survey alt)")
-    ap.add_argument("--af", action="store_true", help="continuous autofocus instead of a lock")
+    ap.add_argument("--focus-alt", type=float, nargs="?", const=SURVEY_ALT_M, default=None,
+                    help="lock focus at N metres (bare flag = survey alt). Default: continuous AF")
+    ap.add_argument("--no-payload", action="store_true", help="confirm + RTL, no drop")
+    ap.add_argument("--unwind-s", type=float, default=UNWIND_S, help="winch unwind time (s)")
+    ap.add_argument("--rewind", action="store_true", help="rewind the line before RTL")
+    ap.add_argument("--af", action="store_true", help="continuous autofocus (the default)")
     ap.add_argument("--res", help="camera resolution WxH, e.g. 4656x3496")
     ap.add_argument("--tiles", type=int, default=SCAN_TILES, help="tile grid N (0 = off)")
     ap.add_argument("--focus-sweep", action="store_true",
@@ -1793,6 +1895,7 @@ def main():
     EXPOSURE_EV = a.ev
     QR_DECODE_ALT_M = a.decode_alt
     FOCUS_M = None if a.af else a.focus_alt
+    PAYLOAD, UNWIND_S, REWIND_BEFORE_RTL = not a.no_payload, a.unwind_s, a.rewind
     if a.res:
         CAM_RES = tuple(int(v) for v in a.res.lower().split("x"))
     if not a.no_wechat:
@@ -1812,6 +1915,7 @@ def main():
     cam.start()
     drone = Drone(a.conn, a.baud, origin)
     took_over = False
+    sv = None
     try:
         drone.wait_gps()
         xy = drone.xy()
@@ -1833,7 +1937,16 @@ def main():
             raise RuntimeError(f"More than {MAX_START_DIST_M:.0f} m from A — "
                                "move the drone near A first")
         drone.set_param("RTL_ALT", SURVEY_ALT_M * 100)
-        input("\n>>> ENTER to arm and take off (area clear!) <<<\n")
+        if PAYLOAD:
+            log.info(f"Payload: on confirm -> unlatch SERVO{LATCH_SERVO}, unwind SERVO"
+                     f"{WINCH_SERVO} {UNWIND_S:.0f} s, {'rewind, ' if REWIND_BEFORE_RTL else ''}RTL")
+            ok1 = drone.servo(LATCH_SERVO, LATCH_CLOSED_PWM, "latch CLOSED")
+            ok2 = drone.servo(WINCH_SERVO, WINCH_STOP_PWM, "winch STOP")
+            if not (ok1 and ok2):
+                log.warning("  Servo check FAILED — the drop may not work. Check "
+                            "SERVO5/6_FUNCTION = 0 before flying (Ctrl+C to abort).")
+        input("\n>>> " + ("Payload LATCHED? " if PAYLOAD else "")
+              + "ENTER to arm and take off (area clear!) <<<\n")
         first_alt = REF_ALT_M if a.ref == "takeoff" else SURVEY_ALT_M
         drone.arm_and_takeoff(first_alt)
         sv = Survey(drone, cam, field, path, origin)
@@ -1860,8 +1973,18 @@ def main():
         import traceback
         traceback.print_exc()
     finally:
+        if PAYLOAD:
+            drone.servo(WINCH_SERVO, WINCH_STOP_PWM, "winch STOP (safety)")
         if not took_over and drone.armed():
             drone.set_mode("RTL")
+        try:
+            if PAYLOAD and sv is not None:
+                log.info("\n══ PAYLOAD ══")
+                log.info(f"  delivered: {'YES over QR #%d' % sv.confirmed.id if sv.payload_done else 'NO'}")
+                for what, ok in sv.payload_log:
+                    log.info(f"  {what:14s} {'ACK ✓' if ok else 'NO ACK ✗'}")
+        except Exception:
+            pass
         cam.stop()
         drone.close()
 
