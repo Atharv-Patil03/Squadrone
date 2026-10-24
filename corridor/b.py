@@ -27,9 +27,15 @@ WHAT IT DOES
      remembered and ignored, search resumes at the same waypoint.
      Pixel->metres is skipped while the drone is tilted > MAX_TILT_DEG
      (camera not looking straight down).
-  6. Align: hold the locked coordinate (FC position control fights wind),
-     keep pushing it with each sighting until centred for ALIGN_HOLD_S.
-  7. Centred + facing corridor -> FINAL_ACTION ("land" for test, "hover").
+  6. Align = STEP-AND-SETTLE: stop, measure the banner over ~1 s (confirmed
+     detections only), move part of the way, stop, measure again. After every
+     move the real movement (telemetry) is compared with how far the banner
+     moved in the camera -> metres-per-pixel scale and axis directions are
+     corrected in flight. Unverified axes are probed with short moves; a move
+     that loses the banner is undone and retried the other way.
+  7. Centred at 5 m -> down to 3 m -> centred again -> straight down to 1.2 m
+     -> LAND ("--hover": hover at 3 m, then RTL). Banner lost and not found
+     again -> RTL, never lands blind.
 
 RUN
   python3 banner_search_dual.py              # fly
@@ -111,9 +117,32 @@ RELOCK_S         = 2.0
 RELOCK_MIN_N     = 5
 RELOCK_SPREAD_M  = 0.8
 
+# ── Centring + landing: STEP-AND-SETTLE visual servo ─────────────────────────
+# Stop -> measure the banner offset over several frames -> move PART of the
+# way (gain) -> stop -> measure again. After every move the script compares
+# how far the drone REALLY moved (telemetry) with how far the banner moved in
+# the camera, and corrects its metres-per-pixel scale (per axis) and axis
+# directions. A 2x scale error (flight 24-10) is fixed after 1-2 steps.
+SERVO_GAIN        = 0.7     # move this fraction of the measured offset
+SERVO_MAX_STEP_M  = 2.0
+PROBE_GAIN        = 0.4     # until an axis is calibrated in flight: small careful
+PROBE_MAX_M       = 1.0     # moves, so a wrong scale/direction can't throw the
+                            # banner out of view (it is measured after each move)
+SERVO_MAX_STEPS   = 20
+SETTLE_SPEED_MS   = 0.15    # "stopped" = slower than this
+SETTLE_TIMEOUT_S  = 8.0
+MEASURE_S         = 0.8     # look this long while stopped
+MEASURE_MIN_N     = 3       # need this many detections in that time
+CENTRE_TOL_5M     = 0.30    # centred within this at search altitude
+CENTRE_TOL_LOW    = 0.20    # ... and at the 3 m stage
+CENTRED_NEEDED    = 2       # consecutive centred measurements
+SCALE_MIN, SCALE_MAX = 0.3, 3.0
+LAND_STAGE_M      = 3.0     # centre again here before the final descent
+FILL_FRAME_FRAC   = 0.55    # banner covers this much of frame = surely over it
+
 # Final action
 FINAL_ACTION   = "land"    # "land" (test) or "hover" (mission)
-LAND_SWITCH_M  = 1.5
+LAND_SWITCH_M  = 1.2       # GUIDED descent to here (centred), then LAND
 DESCENT_MS     = 0.35
 HOVER_ALT_M    = 3.0
 HOVER_TIME_S   = 10
@@ -371,7 +400,18 @@ def measure_fov(cam):
     """Set DOWN_HFOV/VFOV from the crop libcamera is ACTUALLY using."""
     global DOWN_HFOV_DEG, DOWN_VFOV_DEG
     try:
-        full_w, full_h = cam.camera_properties["PixelArraySize"]
+        full = getattr(cam, "sensor_resolution", None)
+        props = getattr(cam, "camera_properties", {}) or {}
+        if not full:
+            full = props.get("PixelArraySize")
+        if not full and props.get("PixelArrayActiveAreas"):
+            full = props["PixelArrayActiveAreas"][0][2:]
+        if not full:
+            sc = (getattr(cam, "camera_controls", {}) or {}).get("ScalerCrop")
+            full = sc[1][2:] if sc else None
+        if not full:
+            raise RuntimeError("sensor size unknown")
+        full_w, full_h = full
         crop = cam.capture_metadata().get("ScalerCrop")
         if not crop:
             log.warning("  no ScalerCrop in metadata — assuming full FOV")
@@ -417,7 +457,10 @@ class CamWorker(threading.Thread):
         # forth across the banner. Force the full-field mode.
         mode = full_fov_mode(self.cam)
         if mode is not None:
-            cfg["raw"] = {"size": mode["size"]}
+            # keep the raw 'format' Picamera2 filled in, only change the size
+            # (flight 24-10 #2: replacing the whole dict -> KeyError 'format')
+            cfg.setdefault("raw", {})
+            cfg["raw"]["size"] = tuple(mode["size"])
         try:
             self.cam.configure(cfg)
         except Exception as e:
@@ -823,6 +866,9 @@ class Mission:
         self.outside = deque(maxlen=40)   # (t, ne) sightings rejected by the gate
         self.t_inside = 0.0               # last sighting accepted by the gate
         self.n_relock = 0
+        self.scale = [1.0, 1.0]           # [fwd, rgt] correction found in flight
+        self.calibrated = [False, False]
+        self.servo_log = []
         self.relock_hist = []
 
     def tick(self, status):
@@ -1008,8 +1054,21 @@ class Mission:
         (then align takes over from the same lock), False if it was a false
         sighting (coordinate is remembered and ignored from now on).
         """
+        # 1) STOP right here and look properly. The banner is usually still in
+        #    view; centring (step-and-settle) then works from here and does not
+        #    depend on the pixel->metres scale being right.
+        log.info("  ◎ Glimpse — stopping to look")
+        self.d.set_speed(ALIGN_SPEED_MS)
+        here = self.here()
+        self.settle(here, SEARCH_ALT_M, "GLIMPSE")
+        m = self.measure(here, SEARCH_ALT_M)
+        if m is not None:
+            log.info(f"  ★ Confirmed from a standstill ({m['n']} looks)")
+            self.lock_ne = here
+            return True
+        # 2) not in view any more: fly to where the glimpse said it was
         self.lock_ne = self.glimpse_ne
-        log.info(f"  ◎ Glimpse → coordinate locked N={self.lock_ne[0]:.2f} "
+        log.info(f"  ◎ Not in view after stopping → coordinate locked N={self.lock_ne[0]:.2f} "
                  f"E={self.lock_ne[1]:.2f}, chasing")
         self.d.set_speed(ALIGN_SPEED_MS)
         t0 = time.time()
@@ -1101,7 +1160,7 @@ class Mission:
         return self.sweep(self.here(), FWD_EXTRA_TRIES)
 
     # ── align ────────────────────────────────────────────────────────────
-    def align(self):
+    def align_old(self):
         log.info("\n── ALIGN (position lock) ──")
         self.d.set_speed(ALIGN_SPEED_MS)
         # keep the lock from the chase — it already points at the banner
@@ -1167,6 +1226,189 @@ class Mission:
                     f"land here (re-locks this attempt: {self.n_relock})")
         return False
 
+
+    # ═════ STEP-AND-SETTLE VISUAL SERVO ═══════════════════════════════════
+    def raw_vec(self, det, alt):
+        """Camera part of the banner offset (fwd, rgt) metres from the nominal
+        FOV — NOT scale-corrected, camera mounting offset NOT included."""
+        f, r = down_pixel_to_body(det["center"][0], det["center"][1], alt)
+        return f - DOWN_OFFSET_FWD_M, r
+
+    def offset_of(self, m):
+        """Banner offset from the DRONE CENTRE, with the in-flight scale."""
+        return (m["raw"][0] * self.scale[0] + DOWN_OFFSET_FWD_M, m["raw"][1] * self.scale[1])
+
+    def settle(self, tgt, alt, label):
+        """Fly to tgt (N,E) at alt and wait until really stopped there."""
+        t0, t_ok = time.time(), None
+        while time.time() - t0 < SETTLE_TIMEOUT_S:
+            self.d.goto_ned(tgt[0], tgt[1], alt, self.yaw)
+            p = self.here()
+            err = math.hypot(tgt[0] - p[0], tgt[1] - p[1])
+            ok = (err < 0.25 and self.d.speed() < SETTLE_SPEED_MS
+                  and abs((self.d.alt() or alt) - alt) < 0.3 and self.d.tilt_deg() < 6)
+            if ok:
+                t_ok = t_ok or time.time()
+                if time.time() - t_ok > 0.3:
+                    return True
+            else:
+                t_ok = None
+            self.tick(f"{label} settle err={err:.2f}m v={self.d.speed():.2f}")
+        return False
+
+    def measure(self, tgt, alt):
+        """Hold still, collect detections for MEASURE_S. Returns dict with
+        median camera vector + full offset, or None if the banner isn't seen."""
+        vecs, fracs, t0, last_t = [], [], time.time(), 0.0
+        while time.time() - t0 < MEASURE_S or (len(vecs) < MEASURE_MIN_N
+                                               and time.time() - t0 < MEASURE_S * 2.5):
+            self.d.goto_ned(tgt[0], tgt[1], alt, self.yaw)
+            # CONFIRMED detections only (seen in >= DOWN_NEED of the last
+            # DOWN_WINDOW frames): a one-frame green patch can't steer the drone
+            det = self.down_conf()
+            if det is not None and det.get("t", 0) != last_t and self.d.tilt_deg() < MAX_TILT_DEG:
+                last_t = det.get("t", 0)
+                a = self.d.alt() or alt
+                vecs.append(self.raw_vec(det, a))
+                fracs.append(det.get("area", 0) / float(CAM_W * CAM_H))
+            self.tick(f"measure {len(vecs)} looks")
+        if len(vecs) < MEASURE_MIN_N:
+            return None
+        return {"raw": (float(np.median([v[0] for v in vecs])),
+                        float(np.median([v[1] for v in vecs]))),
+                "n": len(vecs), "frac": float(np.median(fracs)), "pos": self.here(),
+                "flips": (DOWN_FLIP_X, DOWN_FLIP_Y)}
+
+    def calibrate(self, m0, m1):
+        """Drone moved between two measurements: a fixed banner must shift in
+        the camera by exactly -move. Fix scale / direction per axis."""
+        global DOWN_FLIP_X, DOWN_FLIP_Y
+        if m0["flips"] != m1["flips"]:
+            return                          # measured with different maths
+        mf, mr = ned_to_body(m1["pos"][0] - m0["pos"][0], m1["pos"][1] - m0["pos"][1], self.yaw)
+        df = (m1["raw"][0] - m0["raw"][0]) * self.scale[0]
+        dr = (m1["raw"][1] - m0["raw"][1]) * self.scale[1]
+        for i, (axis, moved, seen) in enumerate((("fwd", mf, df), ("rgt", mr, dr))):
+            if abs(moved) < 0.2:
+                continue
+            ratio = seen / -moved           # 1.0 = perfect; 2.0 = reads 2x too far
+            if ratio < -0.3:                # banner moved WITH the drone = axis reversed
+                if axis == "fwd":
+                    DOWN_FLIP_Y = not DOWN_FLIP_Y
+                else:
+                    DOWN_FLIP_X = not DOWN_FLIP_X
+                self.calibrated[i] = False      # re-check after the flip
+                log.warning(f"    ⚠ {axis} axis REVERSED (moved {moved:+.2f} m, banner "
+                            f"{seen:+.2f} m) — flipped DOWN_FLIP_{'Y' if axis == 'fwd' else 'X'}")
+                continue
+            if ratio < 0.15:
+                continue                    # no usable signal
+            old = self.scale[i]
+            new = min(SCALE_MAX, max(SCALE_MIN, old / ratio))
+            self.scale[i] = old * 0.3 + new * 0.7 if self.calibrated[i] else new
+            self.calibrated[i] = True
+            log.info(f"    scale {axis}: moved {moved:+.2f} m, banner shifted {seen:+.2f} m "
+                     f"(ratio {ratio:.2f}) -> scale {old:.2f} → {self.scale[i]:.2f}")
+
+    def servo_centre(self, alt, tol, label):
+        """Centre over the banner at `alt`. True when centred CENTRED_NEEDED times
+        in a row (or the banner fills the frame at low altitude).
+        Axes whose scale/direction is not yet verified in flight are PROBED one
+        at a time with a short move; if a probe loses the banner the drone goes
+        back and probes that axis the other way (direction was wrong)."""
+        tgt = self.here()
+        prev, good, lost = None, 0, 0
+        probe_sign = [1.0, 1.0]           # -1 = try the opposite of what the camera says
+        probe_size = [PROBE_MAX_M * 0.6, PROBE_MAX_M * 0.6]
+        last_probe = None                 # axis probed by the last move
+        names = ("fwd", "rgt")
+        for step in range(1, SERVO_MAX_STEPS + 1):
+            self.settle(tgt, alt, f"{label} step {step}")
+            m = self.measure(tgt, alt)
+            if m is None:
+                if prev is not None:
+                    # the last move threw the banner out of view -> back
+                    tgt = prev["pos"]
+                    if last_probe is not None:
+                        i = last_probe
+                        probe_sign[i] = -probe_sign[i]
+                        if probe_sign[i] > 0:          # tried both ways: smaller
+                            probe_size[i] = max(0.25, probe_size[i] * 0.5)
+                        log.info(f"    {label} step {step}: lost it after the {names[i]} "
+                                 f"probe — back, next {names[i]} probe "
+                                 f"{'OPPOSITE way' if probe_sign[i] < 0 else 'smaller'}")
+                    else:
+                        self.calibrated = [False, False]
+                        log.info(f"    {label} step {step}: lost it after the move — back, "
+                                 f"probing axes again")
+                    prev, last_probe = None, None
+                    continue
+                lost += 1
+                log.info(f"    {label} step {step}: banner NOT seen ({lost}/3)")
+                if lost >= 3:
+                    return False
+                continue
+            lost = 0
+            if prev is not None:
+                was = list(self.calibrated)
+                self.calibrate(prev, m)
+                if m["flips"] != (DOWN_FLIP_X, DOWN_FLIP_Y):   # an axis was flipped
+                    probe_sign = [1.0, 1.0]
+                    m = self.measure(tgt, alt) or m
+                for i in (0, 1):
+                    if self.calibrated[i] and not was[i]:
+                        probe_sign[i] = 1.0
+            m["off"] = self.offset_of(m)
+            dist = math.hypot(*m["off"])
+            big = m["frac"] >= FILL_FRAME_FRAC and alt <= LAND_STAGE_M + 0.5
+            log.info(f"    {label} step {step}: banner fwd={m['off'][0]:+.2f} rgt={m['off'][1]:+.2f} m "
+                     f"(dist {dist:.2f}, tol {tol:.2f}, {m['n']} looks, fills "
+                     f"{m['frac'] * 100:.0f}% of frame, scale f{self.scale[0]:.2f}/r{self.scale[1]:.2f}"
+                     f"{'' if all(self.calibrated) else ', verified: ' + '+'.join(n for n, c in zip(names, self.calibrated) if c) or ', verified: none'})")
+            self.servo_log.append((label, step, dist))
+            if dist < tol or big:
+                good += 1
+                if good >= CENTRED_NEEDED:
+                    self.lock_ne = tgt
+                    log.info(f"  ✓ CENTRED at {alt:.1f} m: off {dist:.2f} m "
+                             f"({'banner fills the frame' if big else 'within tolerance'})")
+                    return True
+                prev, last_probe = m, None
+                continue                       # measure again from the same spot
+            good = 0
+            step_b = [0.0, 0.0]
+            for i in (0, 1):
+                if self.calibrated[i]:
+                    step_b[i] = max(-SERVO_MAX_STEP_M, min(SERVO_MAX_STEP_M, m["off"][i] * SERVO_GAIN))
+            # probe ONE unverified axis (the one with the bigger offset)
+            unver = [i for i in (0, 1) if not self.calibrated[i] and abs(m["off"][i]) > tol * 0.5]
+            last_probe = None
+            if unver:
+                i = max(unver, key=lambda k: abs(m["off"][k]))
+                size = min(probe_size[i], abs(m["off"][i]) * PROBE_GAIN + 0.2)
+                step_b[i] = math.copysign(size, m["off"][i]) * probe_sign[i]
+                last_probe = i
+            elif not any(self.calibrated):      # offsets tiny but nothing verified
+                for i in (0, 1):
+                    step_b[i] = m["off"][i] * PROBE_GAIN
+            dn, de = body_to_ned(step_b[0], step_b[1], self.yaw)
+            tgt = (m["pos"][0] + dn, m["pos"][1] + de)
+            prev = m
+        log.warning(f"  {label}: not centred after {SERVO_MAX_STEPS} steps")
+        return False
+
+    def descend_to(self, alt, label):
+        tgt = self.lock_ne or self.here()
+        t0 = time.time()
+        while abs((self.d.alt() or alt) - alt) > 0.2 and time.time() - t0 < 25:
+            self.d.goto_ned(tgt[0], tgt[1], alt, self.yaw)
+            self.tick(f"{label} descend {self.d.alt() or 0:.1f} → {alt:.1f} m")
+
+    def align(self):
+        log.info(f"\n── ALIGN at {SEARCH_ALT_M:.0f} m (step-and-settle) ──")
+        self.d.set_speed(ALIGN_SPEED_MS)
+        return self.servo_centre(SEARCH_ALT_M, CENTRE_TOL_5M, "ALIGN")
+
     # ── finish ───────────────────────────────────────────────────────────
     def descend_on_lock(self, final_alt):
         tgt = self.d.alt() or SEARCH_ALT_M
@@ -1193,9 +1435,30 @@ class Mission:
                 return
 
     def finish(self):
+        # stage: down to 3 m, centre again (closer = more accurate)
+        log.info(f"\n── DESCEND to {LAND_STAGE_M:.0f} m and re-centre ──")
+        self.descend_to(LAND_STAGE_M, "STAGE")
+        if not self.servo_centre(LAND_STAGE_M, CENTRE_TOL_LOW, "STAGE"):
+            log.warning("  Lost the banner at 3 m — climbing back to re-centre")
+            self.descend_to(SEARCH_ALT_M, "CLIMB")
+            if not self.servo_centre(SEARCH_ALT_M, CENTRE_TOL_5M, "RE-ALIGN"):
+                log.warning("  ✗ Banner lost — NOT landing blind → RTL")
+                self.releasing = True
+                self.d.set_mode("RTL")
+                return
+            self.descend_to(LAND_STAGE_M, "STAGE")
+            if not self.servo_centre(LAND_STAGE_M, CENTRE_TOL_LOW, "STAGE"):
+                log.warning("  ✗ Still can't centre at 3 m → RTL")
+                self.releasing = True
+                self.d.set_mode("RTL")
+                return
         if FINAL_ACTION == "land":
-            log.info("\n── DESCEND + LAND on banner ──")
-            self.descend_on_lock(LAND_SWITCH_M)
+            log.info(f"\n── FINAL DESCENT to {LAND_SWITCH_M} m over N={self.lock_ne[0]:.2f} "
+                     f"E={self.lock_ne[1]:.2f}, then LAND ──")
+            self.descend_to(LAND_SWITCH_M, "FINAL")
+            p = self.here()
+            log.info(f"  at {self.d.alt() or 0:.2f} m, {math.hypot(p[0] - self.lock_ne[0], p[1] - self.lock_ne[1]):.2f} m "
+                     f"from the centred spot → LAND")
             self.releasing = True
             self.d.set_mode("LAND")
             t0 = time.time()
@@ -1204,7 +1467,7 @@ class Mission:
             log.info("  ✓ Landed" if not self.d.armed() else "  Landing timeout")
         else:
             log.info(f"\n── HOVER {HOVER_ALT_M} m over banner, facing corridor ──")
-            self.descend_on_lock(HOVER_ALT_M)
+            self.descend_to(HOVER_ALT_M, "HOVER")
             t0 = time.time()
             while time.time() - t0 < HOVER_TIME_S:
                 self.d.goto_ned(self.lock_ne[0], self.lock_ne[1], HOVER_ALT_M, self.yaw)
