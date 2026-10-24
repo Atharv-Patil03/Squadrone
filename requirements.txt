@@ -1,0 +1,20 @@
+# SQUADRONE (AT2026RC60) — Python packages for survey.py, banner_search_dual.py (b.py),
+# payload_test.py on a Raspberry Pi 5.
+#
+# DO NOT pip-install these (they come from apt, see setup_pi.sh):
+#   picamera2, libcamera  -> sudo apt install python3-picamera2
+#   numpy                 -> sudo apt install python3-numpy (picamera2 is built against it;
+#                            a pip numpy can break the camera with "numpy.dtype size changed")
+# So the venv MUST be created with:  python3 -m venv --system-site-packages .venv
+#
+# Install:  .venv/bin/pip install -r requirements.txt
+
+# MAVLink link to the Pixhawk (heartbeat, GUIDED, servos, takeoff)
+pymavlink>=2.4.40
+
+# OpenCV WITH the contrib modules: WeChatQRCode (the 10 m QR decoder) lives in contrib.
+# Never install plain "opencv-python" next to it — the two fight over the cv2 module.
+opencv-contrib-python>=4.8
+
+# Fallback QR decoder (needs the system library: sudo apt install libzbar0)
+pyzbar>=0.1.9
