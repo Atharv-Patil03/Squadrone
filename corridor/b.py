@@ -103,6 +103,13 @@ LOCK_EMA         = 0.35
 LOCK_MAX_SPEED   = 0.6
 LOCK_GATE_M      = 1.2     # sightings further than this from the lock = other object
 LOST_GIVEUP_S    = 8.0
+# Re-lock: flight 24-10 hovered 50 s on a stale lock while the camera saw the
+# banner steadily 2.2 m away (every sighting thrown out by LOCK_GATE_M). If the
+# sightings OUTSIDE the gate agree with each other for RELOCK_S, and none fall
+# inside the gate, the lock was wrong -> move it to where the banner really is.
+RELOCK_S         = 2.0
+RELOCK_MIN_N     = 5
+RELOCK_SPREAD_M  = 0.8
 
 # Final action
 FINAL_ACTION   = "land"    # "land" (test) or "hover" (mission)
@@ -758,6 +765,9 @@ class Mission:
         self.t_alog = 0.0
         self.releasing = False    # True once the script itself hands over (LAND/RTL)
         self.t_slog = 0.0
+        self.outside = deque(maxlen=40)   # (t, ne) sightings rejected by the gate
+        self.t_inside = 0.0               # last sighting accepted by the gate
+        self.n_relock = 0
 
     def tick(self, status):
         # Pilot flipped the mode switch (Loiter, RTL...) -> script lets go at once
@@ -827,6 +837,25 @@ class Mission:
         self.lock_ne = (self.lock_ne[0] * (1 - weight) + meas[0] * weight,
                         self.lock_ne[1] * (1 - weight) + meas[1] * weight)
         return True
+
+    def maybe_relock(self, now):
+        """Steady sightings outside the gate + nothing inside it = wrong lock."""
+        recent = [m for t, m in self.outside if now - t <= RELOCK_S and t > self.t_inside]
+        if len(recent) < RELOCK_MIN_N or now - self.t_inside < RELOCK_S:
+            return
+        med = (float(np.median([m[0] for m in recent])), float(np.median([m[1] for m in recent])))
+        spread = max(math.hypot(m[0] - med[0], m[1] - med[1]) for m in recent)
+        if spread > RELOCK_SPREAD_M:
+            return                               # scattered = noise, keep the lock
+        jump = math.hypot(med[0] - self.lock_ne[0], med[1] - self.lock_ne[1])
+        self.n_relock += 1
+        log.warning(f"  ⟲ RE-LOCK #{self.n_relock}: {len(recent)} sightings in {RELOCK_S:.0f} s "
+                    f"agree (spread {spread:.2f} m) but are {jump:.2f} m from the lock -> "
+                    f"lock moved N={self.lock_ne[0]:.2f},E={self.lock_ne[1]:.2f} → "
+                    f"N={med[0]:.2f},E={med[1]:.2f}")
+        self.lock_ne = med
+        self.outside.clear()
+        self.t_inside = now
 
     # ── fly while the DOWN cam watches ────────────────────────────────────
     def fly_watch(self, n, e, label, dwell=DWELL_S):
@@ -1022,7 +1051,11 @@ class Mission:
                     meas = self.down_banner_ne(seen)
                     if meas is not None and self.d.speed() < LOCK_MAX_SPEED:
                         # every sighting pushes the lock; confirmed ones count more
-                        self.push_lock(meas, LOCK_EMA if conf else LOCK_EMA * 0.5)
+                        if self.push_lock(meas, LOCK_EMA if conf else LOCK_EMA * 0.5):
+                            self.t_inside = now
+                        else:
+                            self.outside.append((now, meas))
+                            self.maybe_relock(now)
                 if now - self.t_alog > 1.0:            # 1 Hz diagnostics
                     self.t_alog = now
                     a = self.d.alt() or SEARCH_ALT_M
@@ -1062,8 +1095,11 @@ class Mission:
                 t_good = None
             ce = f"{cam_err:.2f}" if cam_err is not None else "--"
             self.tick(f"ALIGN pos={err:.2f}m cam={ce}m yaw={yaw_err:.0f}° lost={lost:.1f}s")
-        log.warning("  Align timeout")
-        return self.lock_ne is not None
+        # Never land/hover on an unconfirmed spot (before: timeout -> True ->
+        # would have landed 2 m off the banner).
+        log.warning(f"  Align timeout after {ALIGN_TIMEOUT_S:.0f} s — NOT centred, will not "
+                    f"land here (re-locks this attempt: {self.n_relock})")
+        return False
 
     # ── finish ───────────────────────────────────────────────────────────
     def descend_on_lock(self, final_alt):
