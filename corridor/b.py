@@ -123,8 +123,9 @@ CAM_W, CAM_H = 640, 480
 AWB_DAYLIGHT = True        # fixed daylight white balance (see detection notes)
 
 DOWN_MODEL        = "imx519"   # ArduCam, rear, straight down
-DOWN_HFOV_DEG     = 66.0
-DOWN_VFOV_DEG     = 51.0
+DOWN_HFOV_DEG     = 66.0       # FULL-sensor FOV. The actual FOV is recomputed at
+DOWN_VFOV_DEG     = 51.0       # camera start from the sensor crop (see full_fov_config)
+FULL_HFOV_DEG, FULL_VFOV_DEG = DOWN_HFOV_DEG, DOWN_VFOV_DEG
 DOWN_OFFSET_FWD_M = -0.10      # camera vs drone centre (negative = behind) — measure
 DOWN_FLIP_X       = False      # image right  = drone right
 DOWN_FLIP_Y       = True       # survey flight 20-10 + banner drift: fwd/back reversed
@@ -350,6 +351,45 @@ def detect_raw(bgr, min_area, alt=None, why=None):
     return cands[0], mask
 
 
+def full_fov_mode(cam):
+    """Smallest sensor mode that still covers the WHOLE sensor (no crop)."""
+    try:
+        modes = cam.sensor_modes
+        wmax = max(m["crop_limits"][2] for m in modes)
+        full = [m for m in modes if m["crop_limits"][2] >= 0.98 * wmax]
+        best = min(full, key=lambda m: m["size"][0] * m["size"][1])
+        log.info(f"  sensor modes: " + ", ".join(
+            f"{m['size'][0]}x{m['size'][1]}{'(crop)' if m not in full else ''}" for m in modes)
+            + f"  -> using {best['size'][0]}x{best['size'][1]} (full field of view)")
+        return best
+    except Exception as e:
+        log.warning(f"  could not list sensor modes ({e})")
+        return None
+
+
+def measure_fov(cam):
+    """Set DOWN_HFOV/VFOV from the crop libcamera is ACTUALLY using."""
+    global DOWN_HFOV_DEG, DOWN_VFOV_DEG
+    try:
+        full_w, full_h = cam.camera_properties["PixelArraySize"]
+        crop = cam.capture_metadata().get("ScalerCrop")
+        if not crop:
+            log.warning("  no ScalerCrop in metadata — assuming full FOV")
+            return
+        fx, fy = crop[2] / full_w, crop[3] / full_h
+        DOWN_HFOV_DEG = 2 * math.degrees(math.atan(fx * math.tan(math.radians(FULL_HFOV_DEG / 2))))
+        DOWN_VFOV_DEG = 2 * math.degrees(math.atan(fy * math.tan(math.radians(FULL_VFOV_DEG / 2))))
+        msg = (f"  DOWN cam crop {crop[2]}x{crop[3]} of {full_w}x{full_h} "
+               f"({fx * 100:.0f}% x {fy * 100:.0f}%) -> FOV {DOWN_HFOV_DEG:.1f}° x "
+               f"{DOWN_VFOV_DEG:.1f}° (at 5 m the frame covers "
+               f"{2 * 5 * math.tan(math.radians(DOWN_HFOV_DEG / 2)):.1f} x "
+               f"{2 * 5 * math.tan(math.radians(DOWN_VFOV_DEG / 2)):.1f} m)")
+        (log.info if fx > 0.95 and fy > 0.95 else log.warning)(
+            msg + ("" if fx > 0.95 and fy > 0.95 else "  ⚠ CROPPED view — maths adjusted"))
+    except Exception as e:
+        log.warning(f"  FOV measurement failed ({e}) — using {DOWN_HFOV_DEG}° x {DOWN_VFOV_DEG}°")
+
+
 class CamWorker(threading.Thread):
     """One camera: capture + detect in its own thread. `active=False` pauses it."""
 
@@ -371,9 +411,24 @@ class CamWorker(threading.Thread):
         self.cam = Picamera2(index)
         cfg = self.cam.create_preview_configuration(
             main={"size": (CAM_W, CAM_H), "format": "RGB888"}, buffer_count=4)
-        self.cam.configure(cfg)
+        # Flight 24-10: for a 640x480 output libcamera picked the 1280x720 sensor
+        # mode = a CROPPED (zoomed-in) view. The maths assumed the full 66° FOV,
+        # so every distance came out ~2x too big and the drone swung back and
+        # forth across the banner. Force the full-field mode.
+        mode = full_fov_mode(self.cam)
+        if mode is not None:
+            cfg["raw"] = {"size": mode["size"]}
+        try:
+            self.cam.configure(cfg)
+        except Exception as e:
+            log.warning(f"  {self.name}: full-FOV sensor mode refused ({e}) — default mode")
+            cfg = self.cam.create_preview_configuration(
+                main={"size": (CAM_W, CAM_H), "format": "RGB888"}, buffer_count=4)
+            self.cam.configure(cfg)
         self.cam.start()
         time.sleep(1.5)
+        if self.name == "DOWN":
+            measure_fov(self.cam)
         ctrls = {}
         if AWB_DAYLIGHT:
             ctrls.update({"AwbEnable": True, "AwbMode": 5})   # 5 = Daylight
@@ -768,6 +823,7 @@ class Mission:
         self.outside = deque(maxlen=40)   # (t, ne) sightings rejected by the gate
         self.t_inside = 0.0               # last sighting accepted by the gate
         self.n_relock = 0
+        self.relock_hist = []
 
     def tick(self, status):
         # Pilot flipped the mode switch (Loiter, RTL...) -> script lets go at once
@@ -849,6 +905,16 @@ class Mission:
             return                               # scattered = noise, keep the lock
         jump = math.hypot(med[0] - self.lock_ne[0], med[1] - self.lock_ne[1])
         self.n_relock += 1
+        # SWING guard: lock A -> B -> back near A = flying across the banner
+        # and overshooting (distance scale wrong). The banner is in between.
+        prev = self.relock_hist[-1] if self.relock_hist else None
+        self.relock_hist.append(self.lock_ne)
+        if prev is not None and math.hypot(med[0] - prev[0], med[1] - prev[1]) < 1.0:
+            mid = ((med[0] + self.lock_ne[0]) / 2, (med[1] + self.lock_ne[1]) / 2)
+            log.warning(f"  ⚠ SWINGING across the banner (re-lock went back to where it "
+                        f"was before) — camera distance scale is wrong. Using the MIDPOINT "
+                        f"N={mid[0]:.2f},E={mid[1]:.2f}. Check the 'DOWN cam crop' line!")
+            med = mid
         log.warning(f"  ⟲ RE-LOCK #{self.n_relock}: {len(recent)} sightings in {RELOCK_S:.0f} s "
                     f"agree (spread {spread:.2f} m) but are {jump:.2f} m from the lock -> "
                     f"lock moved N={self.lock_ne[0]:.2f},E={self.lock_ne[1]:.2f} → "
