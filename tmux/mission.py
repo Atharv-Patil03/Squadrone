@@ -250,6 +250,10 @@ class MissionRun:
         cam = self.survey_cam_on()
         sv = self.sv
         sv.cam = cam
+        # the corridor left the FC at its slow corridor speed (DO_CHANGE_SPEED
+        # persists) — restore the survey speed (flight 26-10: survey crawled at 0.3 m/s)
+        self.drone.cmd(S.mavutil.mavlink.MAV_CMD_DO_CHANGE_SPEED, 1, S.SPEED_MPS, -1)
+        log.info(f"  speed set back to {S.SPEED_MPS} m/s for the survey")
         xy = self.drone.xy()
         sv.fence_m = max(S.GEOFENCE_MARGIN_M, S.dist_outside(*xy, self.field) + 2.0)
         sv.phase("climb to survey alt")
