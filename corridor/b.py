@@ -78,8 +78,8 @@ ALIGN_SPEED_MS   = 0.7
 CORRIDOR_HEADING_DEG = None   # None = heading on the ground at start
 
 # Forward sweep
-SEARCH_STEP_FWD_M = 2.0   # each try goes this much further forward
-SEARCH_SIDE_M     = 2.0   # left / right leg length
+SEARCH_STEP_FWD_M = 5.0   # each try goes this much further forward
+SEARCH_SIDE_M     = 5.0   # left / right leg length
 MAX_TRIES         = 5
 DWELL_S           = 1.2   # hover + look at each waypoint
 ARRIVE_TOL_M      = 0.35
