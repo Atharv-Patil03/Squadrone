@@ -128,6 +128,10 @@ REWIND_BEFORE_RTL = False    # --rewind: wind the line back up before RTL
 # and resume the survey where it left off. --full-survey = old behaviour
 # (finish the whole lawnmower first, then go to the best match).
 GO_ON_MATCH = True
+CONFIDENT_IMAGE = 0.85      # image score (median of 2+ looks) to interrupt the survey.
+                            # Between IMAGE_MATCH_THRESHOLD and this = "possible match":
+                            # the survey finishes, then the best-scoring QR is visited
+                            # first (operator confirms each).
 
 FOCUS_M          = None           # None = continuous AF (field-proven clear feed, 23-10)
                                   # --focus-alt N locks the lens at N m (was blurry 23-10)
@@ -425,7 +429,11 @@ def scan_qr(bgr):
     text None = a QR shape was found but could not be decoded (too small/blurred).
     Order: WeChatQRCode -> pyzbar -> OpenCV (same as the team's QR script)."""
     if not DECODE_QR:
-        return find_qr_squares(bgr)          # image-only mode: ~10 ms per frame
+        out = []
+        for d in locate_qrs(bgr) + find_qr_squares(bgr):    # accurate corners first
+            if all(math.dist(d["c"], o["c"]) > 40 for o in out):
+                out.append(d)
+        return out
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     out = []
     if _wechat is not None:
@@ -483,8 +491,9 @@ def scan_qr(bgr):
         ok, pts = _cv_qr.detectMulti(half)
     except cv2.error:
         ok, pts = False, None
-    # decode-free squares first (better quads than detectMulti on no-border QRs)
-    for d in find_qr_squares(bgr):
+    # QRs that could not be READ: team-mate's locators (accurate corners), then
+    # the contrast-square finder (works when no finder pattern is visible)
+    for d in locate_qrs(bgr) + find_qr_squares(bgr):
         if all(math.dist(d["c"], o["c"]) > 40 for o in out):
             out.append(d)
     if ok and pts is not None:
@@ -501,7 +510,7 @@ SHAPE_STD_MIN = 38      # local grey std (7x7 at half res) inside a QR
 SHAPE_ASPECT_MAX = 1.45
 SHAPE_FILL_MIN = 0.70
 SHAPE_DENSE_MIN = 0.60  # share of the box that is high-contrast (rejects rings/borders)
-SHAPE_SIDE_PX = (60, 1300)
+SHAPE_SIDE_PX = (60, 2400)
 
 
 def find_qr_squares(bgr, why=None):
@@ -541,6 +550,113 @@ def find_qr_squares(bgr, why=None):
             out.append({"text": None, "c": (cx * s, cy * s), "quad": box, "by": "shape"})
     return out
 
+# ── Team-mate's locators (find a QR WITHOUT reading it) ─────────────────────
+# a) OpenCV QRCodeDetectorAruco.detectMulti — locates codes, decoding not needed
+# b) finder-square geometry: 3 corner squares at a right angle -> full quad
+# Both give accurate corners (better crops than the contrast-square finder).
+_QR_LOC = cv2.QRCodeDetectorAruco() if hasattr(cv2, "QRCodeDetectorAruco") else cv2.QRCodeDetector()
+FINDER_MIN_SIDE_PX, FINDER_MAX_SIDE_PX = 5, 250       # at half resolution
+F_MIN_ASPECT, F_MIN_FILL = 0.75, 0.80
+F_MAX_SIZE_RATIO, F_MAX_LEG_RATIO, F_MAX_ABS_COS = 1.40, 1.30, 0.30
+F_SPACING = (1.5, 12.0)
+
+
+def _finder_candidates(gray):
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    out = []
+    for inv in (cv2.THRESH_BINARY_INV, cv2.THRESH_BINARY):   # dark-on-light AND white-on-black
+        th = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, inv, 51, 7)
+        th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+        cnts, hier = cv2.findContours(th, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        if hier is None:
+            continue
+        raw = []
+        for cnt in cnts:
+            area = cv2.contourArea(cnt)
+            side = math.sqrt(area)
+            if not (FINDER_MIN_SIDE_PX <= side <= FINDER_MAX_SIDE_PX):
+                continue
+            ap = cv2.approxPolyDP(cnt, 0.04 * cv2.arcLength(cnt, True), True)
+            if len(ap) != 4 or not cv2.isContourConvex(ap):
+                continue
+            (cx, cy), (w, h), _ = cv2.minAreaRect(cnt)
+            if w < 1 or h < 1 or min(w, h) / max(w, h) < F_MIN_ASPECT or area / (w * h) < F_MIN_FILL:
+                continue
+            raw.append({"center": np.array([cx, cy], np.float32), "side": side, "area": area})
+        raw.sort(key=lambda c: c["area"], reverse=True)
+        kept = []
+        for c in raw:                          # drop concentric duplicates
+            if all(np.linalg.norm(c["center"] - k["center"]) >= 0.5 * k["side"] for k in kept):
+                kept.append(c)
+        out.append(kept)
+    return out
+
+
+def _best_triple(cands):
+    from itertools import combinations
+    best, best_score = None, float("inf")
+    for trio in combinations(cands[:15], 3):
+        sides = [c["side"] for c in trio]
+        size_ratio = max(sides) / min(sides)
+        if size_ratio > F_MAX_SIZE_RATIO:
+            continue
+        ms = float(np.mean(sides))
+        pts = [c["center"] for c in trio]
+        for v in range(3):
+            p, a, b = pts[v], pts[(v + 1) % 3], pts[(v + 2) % 3]
+            pa, pb = a - p, b - p
+            la, lb = float(np.linalg.norm(pa)), float(np.linalg.norm(pb))
+            if la < 1e-6 or lb < 1e-6:
+                continue
+            leg = max(la, lb) / min(la, lb)
+            cosv = float(np.dot(pa, pb) / (la * lb))
+            if leg > F_MAX_LEG_RATIO or abs(cosv) > F_MAX_ABS_COS:
+                continue
+            if not (F_SPACING[0] <= ((la + lb) / 2) / ms <= F_SPACING[1]):
+                continue
+            sc = abs(cosv) + (leg - 1) + (size_ratio - 1)
+            if sc < best_score:
+                best_score, best = sc, {"trio": trio, "p": p, "a": a, "b": b, "ms": ms}
+    return best
+
+
+def _triple_to_quad(m):
+    p, a, b = m["p"], m["a"], m["b"]
+    d = a + b - p
+    u = (a - p) / np.linalg.norm(a - p)
+    v = (b - p) / np.linalg.norm(b - p)
+    h = m["ms"] / 2.0
+    return np.array([p - h * u - h * v, a + h * u - h * v, d + h * u + h * v, b - h * u + h * v],
+                    np.float32)
+
+
+def locate_qrs(bgr):
+    """Team-mate's locators on a half-size image -> [{'text': None, 'quad', 'c', 'by'}]."""
+    H, W = bgr.shape[:2]
+    s = 2 if W > 1400 else 1
+    g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    if s > 1:
+        g = cv2.resize(g, (W // s, H // s), interpolation=cv2.INTER_AREA)
+    out = []
+    try:
+        ok, pts = _QR_LOC.detectMulti(g)
+        if ok and pts is not None:
+            for q in np.asarray(pts, np.float32).reshape(-1, 4, 2):
+                out.append({"text": None, "quad": q * s, "c": tuple(q.mean(axis=0) * s),
+                            "by": "aruco-locate"})
+    except cv2.error:
+        pass
+    for cands in _finder_candidates(g):
+        for _ in range(3):
+            m = _best_triple(cands)
+            if m is None:
+                break
+            q = _triple_to_quad(m) * s
+            out.append({"text": None, "quad": q, "c": tuple(q.mean(axis=0)), "by": "finders"})
+            used = {id(c) for c in m["trio"]}
+            cands = [c for c in cands if id(c) not in used]
+    return out
+
 
 def _ordered_quad(quad):
     """4 corners in one consistent winding (so crops are never mirrored)."""
@@ -569,14 +685,17 @@ def qr_crop(gray, quad, margin=0.06):
         return None
 
 
-def image_similarity(ref_gray, cand_gray, scales=(0.94, 1.0, 1.06)):
-    """Normalised correlation (-1..1): best over 4 rotations x 3 scales x small
-    shifts (template = middle 80 % of the reference, slid over the candidate).
-    Synthetic no-data QRs at 9-11 m vs reference at 5 m: same 0.75-0.96,
-    different 0.18-0.47 (old fixed-crop version: same down to 0.56)."""
-    ref = cv2.GaussianBlur(ref_gray, (0, 0), 2.0)
-    cand = cv2.GaussianBlur(cand_gray, (0, 0), 2.0)
-    best = -1.0
+def image_similarity(ref_gray, cand_gray, scales=(0.94, 1.0, 1.06), corner=0.30):
+    """1) find the best alignment: 4 rotations x 3 scales x small shifts (template
+    = middle 80 % of the reference slid over the candidate);
+    2) score ONLY the data area of that alignment: the 4 corners (finder
+    patterns — identical in every QR) are left out. Otherwise two different
+    QRs look ~0.8 alike just because of their finder squares.
+    Synthetic no-data QRs, reference 5 m vs 9-11 m: same 0.89-0.98 (median 0.95),
+    different median 0.36 (worst look-alike with the same overlay box: 0.83)."""
+    ref = cv2.GaussianBlur(ref_gray, (0, 0), 2.0).astype(np.float32)
+    cand = cv2.GaussianBlur(cand_gray, (0, 0), 2.0).astype(np.float32)
+    best = (-2.0, None)
     for sc in scales:
         t = cv2.resize(ref, None, fx=sc, fy=sc, interpolation=cv2.INTER_AREA)
         k = int(t.shape[0] * 0.80)
@@ -584,9 +703,18 @@ def image_similarity(ref_gray, cand_gray, scales=(0.94, 1.0, 1.06)):
         t = t[o:o + k, o:o + k]
         c = cand
         for _ in range(4):
-            best = max(best, float(cv2.matchTemplate(c, t, cv2.TM_CCOEFF_NORMED).max()))
-            c = cv2.rotate(c, cv2.ROTATE_90_CLOCKWISE)
-    return best
+            _, mx, _, loc = cv2.minMaxLoc(cv2.matchTemplate(c, t, cv2.TM_CCOEFF_NORMED))
+            if mx > best[0]:
+                best = (mx, (t, c, loc))
+            c = np.ascontiguousarray(np.rot90(c, -1))
+    _, (t, c, (x, y)) = best
+    win = c[y:y + t.shape[0], x:x + t.shape[1]]
+    n = t.shape[0]
+    m = np.ones(t.shape, bool)
+    q = max(1, int(n * (corner - 0.10) / 0.80))
+    m[:q, :q] = m[:q, n - q:] = m[n - q:, :q] = m[n - q:, n - q:] = False
+    a, b = t[m] - t[m].mean(), win[m] - win[m].mean()
+    return float((a * b).sum() / (np.sqrt((a * a).sum() * (b * b).sum()) + 1e-9))
 
 
 class Reference:
@@ -734,6 +862,7 @@ class SurveyCam(threading.Thread):
         self.overlay = ""                 # mission writes alt/speed/phase here
         self.focus_info = ""
         self.scan_enabled = True
+        self.last_frame = None
         self.n_saved = 0
 
     def open(self):
@@ -847,6 +976,7 @@ class SurveyCam(threading.Thread):
             self._shutter_control(md, sg)
             t_scan = time.time()
             qrs = scan_qr(frame) if self.scan_enabled else []
+            self.last_frame = frame
             if qrs:
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 fh, fw = gray.shape
@@ -1144,7 +1274,7 @@ class QR:
         if self.text_match:
             return True
         return bool(self.sims) and len(self.sims) >= 2 and \
-            float(np.median(self.sims)) >= IMAGE_MATCH_THRESHOLD
+            float(np.median(self.sims)) >= CONFIDENT_IMAGE
 
     def verdict(self):
         """-> (True/False/None, short reason)"""
@@ -1902,6 +2032,7 @@ def bench(dist=None, save_ref=False):
     show = bool(os.environ.get("DISPLAY"))
     t_log = 0
     fovs = []
+    t_why = 0
     try:
         while True:
             obs = cam.drain()
@@ -1911,6 +2042,16 @@ def bench(dist=None, save_ref=False):
                 qs = [f"{q['text']} [{q.get('by', '?')}]" if q["text"]
                       else "(QR shape, not decoded)" for q in o["qrs"]]
                 log.info(f"fps {cam.fps:.1f}  scan {cam.scan_ms:.0f} ms  QRs {qs}")
+                part = [q for q in o["qrs"] if q.get("quad") is not None and not q.get("full", True)]
+                if part:
+                    log.info(f"    {len(part)} QR(s) touch the frame edge — not used for matching; "
+                             "hold the WHOLE QR inside the view")
+                if not o["qrs"] and time.time() - t_why > 3 and cam.last_frame is not None:
+                    t_why = time.time()
+                    why = []
+                    find_qr_squares(cam.last_frame, why)
+                    log.info(f"    why no QR: sharpness {cam.sharp:.0f} (blurry < 30?), "
+                             f"{len(why)} contrast blob(s): " + ("; ".join(why[:3]) or "none"))
                 crops = [q for q in o["qrs"] if q.get("crop") is not None]
                 if save_ref and crops:
                     q = min(crops, key=lambda d: math.dist(d["c"], (o["w"] / 2, o["h"] / 2)))
