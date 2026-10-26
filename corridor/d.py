@@ -151,7 +151,7 @@ AFTER_CORRIDOR    = "land"   # land | hover | rtl | climb
 # ── LiDARs: 3x TFmini-S on the Pi's I2C bus ──────────────────────────────────
 I2C_BUS           = 1
 LIDAR_FILE        = os.path.expanduser("~/squadrone/lidars.json")   # --lidar-scan
-LIDAR_ADDR        = {"front": 0x14, "left": 0x15, "right": 0x11}     # team's wiring (25-10)
+LIDAR_ADDR        = {"front": 0x14, "left": 0x11, "right": 0x15}     # team's wiring (25-10)
 LIDAR_BIAS_M      = -0.04    # subtracted -> ADDS 4 cm, same as the team's test script
 FRONT_TIP_M       = 0.15     # front prop tip is this far AHEAD of the front lidar
 SIDE_TIP_M        = 0.18     # side prop tips are this far OUTSIDE the side lidars

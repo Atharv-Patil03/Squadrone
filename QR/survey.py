@@ -119,7 +119,7 @@ WINCH_SERVO      = 5
 WINCH_STOP_PWM   = 1500
 WINCH_UNWIND_PWM = 1000      # lowers the payload
 WINCH_REWIND_PWM = 2000      # pulls it back up
-UNWIND_S         = 40.0
+UNWIND_S         = 60.0
 REWIND_BEFORE_RTL = False    # --rewind: wind the line back up before RTL
 
 # GO_ON_MATCH: the moment a QR is a CONFIDENT match (same text, or image score
