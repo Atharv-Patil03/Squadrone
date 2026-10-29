@@ -327,6 +327,8 @@ def main():
     ap.add_argument("--skip-survey", action="store_true")
     ap.add_argument("--no-payload", action="store_true")
     ap.add_argument("--image-only", action="store_true")
+    ap.add_argument("--no-border", action="store_true",
+                    help="practice strip without the white border (wide colour gate)")
     ap.add_argument("--markers", choices=["apriltag", "qr"], default="apriltag",
                     help="apriltag = AprilTag 36h11 IDs (competition), qr = old QR pipeline")
     ap.add_argument("--tries", type=int)
@@ -352,7 +354,8 @@ def main():
     if S.DECODE_QR:
         S.load_wechat(None)
     # corridor settings
-    C.set_banner_color("green")
+    C.WHITE_BORDER = not a.no_border
+    C.set_banner_color("green", loose=a.no_border)
     C.OBSTACLES = False
     if a.cam == "imx500":
         C.DOWN_MODEL = "imx500"
@@ -370,7 +373,7 @@ def main():
     log.info("=" * 64)
     log.info(f"SQUADRONE FULL MISSION  cam={a.cam}  corridor={'skip' if a.skip_corridor else 'green'}  "
              f"survey={'skip' if a.skip_survey else 'yes'}  payload={'yes' if S.PAYLOAD else 'no'}  "
-             f"markers={a.markers if a.markers == 'apriltag' else ('QR image only' if a.image_only else 'QR read + image')}")
+             f"banner={'practice (no border)' if a.no_border else 'venue (white border)'}  markers={a.markers if a.markers == 'apriltag' else ('QR image only' if a.image_only else 'QR read + image')}")
     log.info(f"  banner search {C.MAX_TRIES} tries x {C.SEARCH_STEP_FWD_M} m, ±{C.SEARCH_SIDE_M} m | "
              f"corridor {C.CORRIDOR_LEN_M} x {C.CORRIDOR_W_M} m at {C.CORRIDOR_ALT_M} m, "
              f"{C.CORRIDOR_SPEED} m/s | survey {S.SURVEY_ALT_M} m, delivery {S.DELIVERY_ALT_M} m")
