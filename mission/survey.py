@@ -121,8 +121,8 @@ LATCH_OPEN_PWM   = 1000
 LATCH_WAIT_S     = 2.0
 WINCH_SERVO      = 5
 WINCH_STOP_PWM   = 1500
-WINCH_UNWIND_PWM = 1000      # lowers the payload
-WINCH_REWIND_PWM = 2000      # pulls it back up
+WINCH_UNWIND_PWM = 2000      # lowers the payload
+WINCH_REWIND_PWM = 1000      # pulls it back up
 UNWIND_S         = 40.0
 REWIND_BEFORE_RTL = False    # --rewind: wind the line back up before RTL
 

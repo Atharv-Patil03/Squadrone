@@ -149,7 +149,7 @@ CORRIDOR_W_M      = 3.5      # 11.5 ft between the walls
 WALL_H_M          = 2.44     # 8 ft
 CORRIDOR_ALT_M    = 1.3      # fly height inside (walls 2.44 m)
 CORRIDOR_SPEED    = 0.5      # m/s inside
-BACKOFF_M         = 2.5      # descend this far BEFORE the banner (arch is above it)
+BACKOFF_M         = 2.0      # descend this far BEFORE the banner (arch is above it)
 EXIT_MARGIN_M     = 1.5      # keep going this far past the far end
 # END OF CORRIDOR = the side LiDARs lose BOTH walls (nothing marks the far end).
 # Walls must first have been seen over WALLS_MIN_FRAC of the expected length,

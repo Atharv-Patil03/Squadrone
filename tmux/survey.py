@@ -68,7 +68,7 @@ INSET_M = 2.0
 
 SURVEY_ALT_M    = 10.0
 SPACING_M       = 8.0
-SPEED_MPS       = 1.5
+SPEED_MPS       = 1.0
 ACCEPT_RADIUS_M = 1.0
 WAYPOINT_TIMEOUT = 120
 GEOFENCE_MARGIN_M = 3.0    # further than this outside the field -> RTL
@@ -123,7 +123,7 @@ WINCH_SERVO      = 5
 WINCH_STOP_PWM   = 1500
 WINCH_UNWIND_PWM = 1000      # lowers the payload
 WINCH_REWIND_PWM = 2000      # pulls it back up
-UNWIND_S         = 40.0
+UNWIND_S         = 50.0
 REWIND_BEFORE_RTL = False    # --rewind: wind the line back up before RTL
 
 # GO_ON_MATCH: the moment a QR is a CONFIDENT match (same text, or image score

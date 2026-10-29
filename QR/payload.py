@@ -56,8 +56,8 @@ LATCH_WAIT_S     = 2.0
 
 WINCH_SERVO       = 5      # 3-position switch in the GUI
 WINCH_STOP_PWM    = 1500   # GUI "MID"
-WINCH_UNWIND_PWM  = 1000   # GUI "HIGH" (assumed: lowers the payload)
-WINCH_REWIND_PWM  = 2000   # GUI "LOW"  (assumed: pulls it back up)
+WINCH_UNWIND_PWM  = 2000   # GUI "HIGH" (assumed: lowers the payload)
+WINCH_REWIND_PWM  = 1000   # GUI "LOW"  (assumed: pulls it back up)
 UNWIND_S          = 40.0
 
 TAKEOFF_ALT_M = 10.0
