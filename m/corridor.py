@@ -30,6 +30,7 @@ RUN
   python3 corridor.py                       # green corridor, land after
   python3 corridor.py --blue                # blue banner (no obstacle logic yet)
   python3 corridor.py --no-border           # PRACTICE strip without the white border
+  python3 corridor.py --test-image a.jpg b.png [--blue]   # detector on photos, no drone
   python3 corridor.py --tries 6 --step 3 --side 2   # search pattern
 """
 
@@ -232,7 +233,10 @@ COLORS = {   # name: (HSV low, HSV high, Lab channel, Lab max)
     # VENUE banners (photos 30-10): green H 80-81 S 254-255 a* 74 in sun AND shade;
     # the venue's sports-court green is H 72 S 150 a* 97 and passed the old gate
     # (33 % of the photo!) -> saturation >= 170 and a* <= 92 split them.
-    "green": (np.array([68, 170, 50]), np.array([95, 255, 255]), 1, 92),
+    # Organisers: banner colour #00B140 = H 71 S 255 a* 66. Hue 55-95 covers it
+    # with camera white-balance shifts; grass (H 37-40, a* 93-99) and the court
+    # (a* 97) are cut by a* <= 90.
+    "green": (np.array([55, 150, 50]), np.array([95, 255, 255]), 1, 90),
     # blue banner H 106 S 255 b* 73; court blue H 106 S 253 b* 86 (darker);
     # bluish shadows on paving S < 120 -> S >= 190, b* <= 80 (+ white border)
     "blue":  (np.array([98, 190, 50]), np.array([120, 255, 255]), 2, 80),
@@ -245,6 +249,8 @@ COLORS = {   # name: (HSV low, HSV high, Lab channel, Lab max)
 # mostly white. Off for practice strips without a border (--no-border).
 WHITE_BORDER     = True
 BORDER_MIN_FRAC  = 0.40      # share of the ring that must be white
+BORDER_CLEAR     = 0.75      # this white all round = surely a bordered banner, any shape
+                             # (organisers' sample 30-10 is a SQUARE in a thin white frame)
 # "white" border, (S max, V min): the green banner's border is pure white
 # (S ~25); the BLUE banner's border is printed PALE BLUE (photo 30-10: S 130-165,
 # V 175-185) -> looser saturation for blue.
@@ -278,7 +284,7 @@ def white_border_mask(hsv):
     return m
 
 
-def border_white_frac(bgr, c, short_px):
+def border_white_frac(bgr, c, short_px, thin_ok=True):
     """Share of white pixels in a ring just outside contour c (None = no ring)."""
     H, W = bgr.shape[:2]
     r = max(2, int(round(BORDER_RING_FRAC * short_px)))
@@ -288,14 +294,20 @@ def border_white_frac(bgr, c, short_px):
     m = np.zeros((y1 - y0, x1 - x0), np.uint8)
     cv2.drawContours(m, [c - np.array([x0, y0])], -1, 255, -1)
     inner = cv2.dilate(m, np.ones((3, 3), np.uint8))          # skip the blended edge
-    outer = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 3, 2 * r + 3)))
-    ring = cv2.subtract(outer, inner) > 0
-    n = int(ring.sum())
-    if n < 20:
-        return None
     hsv = cv2.cvtColor(bgr[y0:y1, x0:x1], cv2.COLOR_BGR2HSV)
     white = white_border_mask(hsv)
-    return float((white & ring).sum()) / n
+    # borders differ: venue strip ~20 % of its height, organisers' square sample
+    # only ~2 % of its side -> try a thin ring AND the wide one, keep the whiter
+    best = None
+    for rr in (sorted({2, max(2, r // 2), r}) if thin_ok else [r]):
+        outer = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * rr + 3, 2 * rr + 3)))
+        ring = cv2.subtract(outer, inner) > 0
+        n = int(ring.sum())
+        if n < 20:
+            continue
+        f = float((white & ring).sum()) / n
+        best = f if best is None else max(best, f)
+    return best
 # Shape / texture (all rotation-invariant)
 MIN_FILL      = 0.60       # contour area / min-area rotated rectangle
 MIN_SOLIDITY  = 0.75       # contour area / convex hull
@@ -632,9 +644,6 @@ def detect_raw(bgr, min_area, alt=None, why=None):
         if solidity < MIN_SOLIDITY:
             reject(c, f"ragged edge: solidity={solidity:.2f} < {MIN_SOLIDITY}")
             continue
-        if WHITE_BORDER and elong < MIN_ELONG:
-            reject(c, f"not a strip: {elong:.1f}:1 < {MIN_ELONG}:1 (venue banner is ~10:1)")
-            continue
         if elong > MAX_ELONG:
             reject(c, f"too long/thin: {elong:.1f} > {MAX_ELONG}")
             continue
@@ -653,7 +662,10 @@ def detect_raw(bgr, min_area, alt=None, why=None):
         # and must not outvote the smooth rest of it
         tv = tex[y:y + h, x:x + w][inner > 0]
         texture = float(np.median(tv)) if tv.size else 255.0
-        wb = border_white_frac(bgr, c, min(rw, rh)) if WHITE_BORDER else None
+        # thin border rings only for STRIPS: a square inside thin white lines is
+        # what a white-lined court box looks like
+        wb = (border_white_frac(bgr, c, min(rw, rh), thin_ok=elong >= MIN_ELONG)
+              if WHITE_BORDER else None)
         if id(c) in hole_ids and elong >= 3.0:   # strip INSIDE a white frame: border proven
                                                  # (court boxes drawn by white lines are not strips)
             wb = max(wb or 0.0, 0.8)
@@ -663,9 +675,19 @@ def detect_raw(bgr, min_area, alt=None, why=None):
         if texture > tex_max:
             reject(c, f"too textured: {texture:.1f} > {tex_max:.0f}")
             continue
-        if WHITE_BORDER and area > 0.5 * CAM_W * CAM_H:
-            reject(c, f"covers {area / (CAM_W * CAM_H):.0%} of the frame — turf/court, "
-                      "the banner strip is never that big at search height")
+        clear_border = wb is not None and wb >= BORDER_CLEAR
+        if WHITE_BORDER and area > 0.5 * CAM_W * CAM_H and not clear_border:
+            reject(c, f"covers {area / (CAM_W * CAM_H):.0%} of the frame without a clear "
+                      "white border around it — turf/court")
+            continue
+        if WHITE_BORDER and elong < MIN_ELONG and area < 8 * min_area:
+            reject(c, f"small AND not a strip ({elong:.1f}:1, {area:.0f}px < {8 * min_area}px) "
+                      "— patch/shadow, not a banner")
+            continue
+        if WHITE_BORDER and elong < MIN_ELONG and not clear_border:
+            reject(c, f"not a strip ({elong:.1f}:1 < {MIN_ELONG}:1) and border only "
+                      f"{(wb or 0) * 100:.0f}% white (< {BORDER_CLEAR * 100:.0f}% needed for a "
+                      "square/short banner)")
             continue
         if WHITE_BORDER and wb is None:
             reject(c, "covers the whole frame — no white border visible (turf/court of "
@@ -681,7 +703,8 @@ def detect_raw(bgr, min_area, alt=None, why=None):
         m = cv2.moments(c)
         score = (fill * solidity * max(0.2, 1.0 - 0.5 * texture / MAX_TEXTURE)
                  * (0.6 + 0.4 * min(1.0, wb or 0.0))
-                 * min(1.0, math.sqrt(area / (min_area * 6))))
+                 * min(1.0, math.sqrt(area / (min_area * 6)))
+                 * (1.0 + 0.15 * math.log(max(1.0, area / min_area))))   # bigger = closer/whole
         bp = cv2.boxPoints(((rcx, rcy), (rw, rh), ang))
         e1, e2 = bp[1] - bp[0], bp[2] - bp[1]
         ax = e1 if np.hypot(*e1) >= np.hypot(*e2) else e2
@@ -2515,15 +2538,53 @@ def bench(down, fwd, pv, alt=SEARCH_ALT_M):
 # MAIN
 # ═════════════════════════════════════════════════════════════════════════════
 
+def test_images(paths):
+    """--test-image: run the banner detector on photos/screenshots (no camera,
+    no drone). Prints every reason and saves <name>_detect.jpg next to DEBUG_DIR."""
+    for pth in paths:
+        img = cv2.imread(pth)
+        if img is None:
+            print(f"{pth}: can't read")
+            continue
+        # same size as the flight camera (640x480), aspect kept, grey padding
+        k = min(CAM_W / img.shape[1], CAM_H / img.shape[0])
+        sm = cv2.resize(img, (int(img.shape[1] * k), int(img.shape[0] * k)),
+                        interpolation=cv2.INTER_AREA)
+        frame = np.full((CAM_H, CAM_W, 3), 0, np.uint8)
+        y0, x0 = (CAM_H - sm.shape[0]) // 2, (CAM_W - sm.shape[1]) // 2
+        frame[y0:y0 + sm.shape[0], x0:x0 + sm.shape[1]] = sm
+        why = []
+        det, mask = detect_raw(frame, DOWN_MIN_AREA, why=why)
+        print(f"\n{pth}  ({BANNER_COLOR}, white border {'ON' if WHITE_BORDER else 'OFF'}):  "
+              + ("FOUND at px (%d, %d), %.1f:1, area %d px" % (det["center"][0], det["center"][1],
+                                                              det["elong"], det["area"])
+                 if det else "NOT FOUND"))
+        for w in why:
+            print("   " + w)
+        out = frame.copy()
+        if det:
+            cv2.polylines(out, [cv2.boxPoints(det["rbox"]).astype(np.int32)], True, (0, 0, 255), 2)
+        vis = np.hstack([out, cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)])
+        name = os.path.join(DEBUG_DIR, os.path.splitext(os.path.basename(pth))[0] + "_detect.jpg")
+        cv2.imwrite(name, vis)
+        print(f"   saved {name} (left: result, right: colour mask)")
+
+
 def main():
-    global Picamera2, mavutil
-    from picamera2 import Picamera2 as _P
-    Picamera2 = _P
+    global Picamera2, mavutil, WHITE_BORDER
+    if "--test-image" not in sys.argv:
+        from picamera2 import Picamera2 as _P
+        Picamera2 = _P
 
     global TEX_PIX_MAX, MAX_TEXTURE, DOWN_FLIP_X, DOWN_FLIP_Y, FINAL_ACTION, SEARCH_ALT_M
     global MAX_TRIES, SEARCH_STEP_FWD_M, SEARCH_SIDE_M, CORRIDOR_LEN_M, CORRIDOR_ALT_M
     global CORRIDOR_W_M, AFTER_CORRIDOR, CORRIDOR_SPEED
     a = sys.argv
+    if "--test-image" in a:                   # offline, before any camera import
+        WHITE_BORDER = "--no-border" not in a
+        set_banner_color("blue" if "--blue" in a else "green", loose=not WHITE_BORDER)
+        test_images([x for x in a[a.index("--test-image") + 1:] if not x.startswith("--")])
+        return
 
     def arg(name, typ=float):
         return typ(a[a.index(name) + 1]) if name in a else None
@@ -2534,7 +2595,6 @@ def main():
     if "--lidar-bench" in a:
         lidar_bench()
         return
-    global WHITE_BORDER
     WHITE_BORDER = "--no-border" not in a
     set_banner_color("blue" if "--blue" in a else "green", loose=not WHITE_BORDER)
     log.info(f"Banner: {BANNER_COLOR}, " + ("VENUE banner (white border required, strict colour)"
