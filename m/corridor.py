@@ -30,6 +30,7 @@ RUN
   python3 corridor.py                       # green corridor, land after
   python3 corridor.py --blue                # blue banner (no obstacle logic yet)
   python3 corridor.py --no-border           # PRACTICE strip without the white border
+  python3 corridor.py --gap-bench           # LiDARs: what the blue GAP navigation would do
   python3 corridor.py --test-image a.jpg b.png [--blue]   # detector on photos, no drone
   python3 corridor.py --tries 6 --step 3 --side 2   # search pattern
 """
@@ -151,7 +152,7 @@ CORRIDOR_W_M      = 3.5      # 11.5 ft between the walls
 WALL_H_M          = 2.44     # 8 ft
 CORRIDOR_ALT_M    = 1.3      # fly height inside (walls 2.44 m)
 CORRIDOR_SPEED    = 0.5      # m/s inside
-BACKOFF_M         = 2.5      # descend this far BEFORE the banner (arch is above it)
+BACKOFF_M         = 2.0      # descend this far BEFORE the banner (arch is above it)
 EXIT_MARGIN_M     = 1.5      # keep going this far past the far end
 # END OF CORRIDOR = the side LiDARs lose BOTH walls (nothing marks the far end).
 # Walls must first have been seen over WALLS_MIN_FRAC of the expected length,
@@ -171,7 +172,23 @@ ALT_SINK_M        = 0.30     # inside: this far below CORRIDOR_ALT_M -> stop + l
 # and every hit is stored as a point in the corridor (along, across). The drone
 # picks the lane (across position) farthest from the hits ahead, moves there
 # FIRST, scans one full sweep, then advances. Walls keep their safety limits.
-OBSTACLES         = False    # --obstacles (on by default with --blue)
+OBSTACLES         = False    # --obstacles: OLD sweep planner (unsafe in sim, kept for reference)
+# GAP mode (31-10, blue corridor photo: 2 boards near the walls at the entry,
+# 1 board in the middle further in). No nose sweep. The drone keeps centred
+# between WHATEVER the side LiDARs see (walls or boards). When the front LiDAR
+# sees a board closer than GAP_DETECT_M it stops, slides sideways (side with
+# more room) until the front beam is clear, slides GAP_EXTRA_M more (beam is at
+# the drone centre, props stick out), passes the board holding that line, then
+# re-centres. Side too tight on both sides / no gap in GAP_TIMEOUT_S -> climb out.
+OBST_MODE         = None     # "gap" = --gap (blue corridor option 2)
+GAP_DETECT_M      = 2.0      # front reading below this (and before the end) = board ahead
+GAP_CLEAR_M       = 2.6      # front reading above this (or none) = beam is past the board
+GAP_EXTRA_M       = 0.58     # extra slide after the beam clears (0.225 half-width + margin)
+GAP_SIDE_MIN_M    = 0.40     # prop-to-side clearance needed to keep sliding that way
+GAP_PASS_M        = 0.8      # keep the line until this far past the board's front face
+GAP_TIMEOUT_S     = 15
+GAP_MIN_CLEAR_M   = 0.25     # prop-tip clearance wanted on BOTH sides of the gap
+GAP_CENTRE_TOL_M  = 0.25     # tracking: stop going forward while further than this off-centre
 OBST_DETECT_M     = 2.2      # front hits closer than this (+1 m) and closer than the end count
 SWEEP_DEG         = 15       # nose swings ±15° so the single front beam scans ±0.6 m at 2.2 m
 SWEEP_PERIOD_S    = 2.4
@@ -185,6 +202,10 @@ LOOKAHEAD_M       = 1.0      # position carrot ahead of the drone
 CENTRE_GAIN       = 0.35     # EMA weight of each LiDAR centre estimate
 MAX_YAW_FIX_DEG   = 60       # banner says corridor is further than this from the nose -> don't enter
 ABORT_ALT_M       = 4.0      # climb out of the corridor to this, then RTL
+# What a corridor ABORT does after the vertical climb-out:
+#   "rtl"      = hand over to RTL (standalone corridor.py)
+#   "continue" = return False and let mission.py carry on (lawnmower / next phase)
+ON_ABORT          = "rtl"
 AFTER_CORRIDOR    = "land"   # land | hover | rtl | climb
 
 # ── LiDARs: 3x TFmini-S on the Pi's I2C bus ──────────────────────────────────
@@ -239,7 +260,11 @@ COLORS = {   # name: (HSV low, HSV high, Lab channel, Lab max)
     "green": (np.array([55, 150, 50]), np.array([95, 255, 255]), 1, 90),
     # blue banner H 106 S 255 b* 73; court blue H 106 S 253 b* 86 (darker);
     # bluish shadows on paving S < 120 -> S >= 190, b* <= 80 (+ white border)
-    "blue":  (np.array([98, 190, 50]), np.array([120, 255, 255]), 2, 80),
+    # corridor photo 30-10: the ground blue banner in SUN reads H 96-98, S 255,
+    # V 255 (over-exposed, cyan-ish), b* 83-90 -> widened; the court blue that
+    # also passes now is rejected by the white-border test.
+    # court blue is DARKER (V 130-135, b* 87): V >= 145 keeps it out
+    "blue":  (np.array([90, 190, 145]), np.array([125, 255, 255]), 2, 95),
     # old wide gates (our practice strips, no white border): --loose-color
     "green-loose": (np.array([35, 80, 50]), np.array([85, 255, 255]), 1, 120),
     "blue-loose":  (np.array([100, 120, 40]), np.array([130, 255, 255]), 2, 110),
@@ -473,7 +498,11 @@ def white_frame_holes(bgr, min_area):
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     white = white_border_mask(hsv).astype(np.uint8) * 255
     white = cv2.morphologyEx(white, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
-    col = cv2.inRange(hsv, LOWER_GREEN, UPPER_GREEN)
+    # inside the frame only hue + saturation must fit: a shadow across the banner
+    # (arch, pole, drone) makes it darker but not a different colour
+    lo = LOWER_GREEN.copy()
+    lo[2] = 40
+    col = cv2.inRange(hsv, lo, UPPER_GREEN)
     cnts, hier = cv2.findContours(white, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
     out = []
     if hier is None:
@@ -1027,6 +1056,40 @@ def lidar_scan():
     with open(LIDAR_FILE, "w") as f:
         json.dump({k: f"0x{v:02X}" for k, v in names.items()}, f, indent=2)
     log.info(f"Saved {LIDAR_FILE}")
+
+
+def gap_bench():
+    """--gap-bench: live LiDARs -> what GAP mode WOULD do. Carry the drone (or
+    hold boards) in a mock corridor; no motors, no GPS."""
+    li = Lidars()
+    li.start()
+    log.info("GAP BENCH — Ctrl+C to stop. Put a board 1-2 m in front, walls/boards at the sides.")
+    try:
+        while True:
+            F, L, R = li.get("front"), li.get("left"), li.get("right")
+            fm = lambda v: f"{v:4.2f}" if v is not None else " -- "
+            msg = f"F {fm(F)}  L {fm(L)}  R {fm(R)}  | "
+            lc = L - SIDE_TIP_M if L is not None else None
+            rc = R - SIDE_TIP_M if R is not None else None
+            if F is not None and F < GAP_DETECT_M:
+                roomL = L if L is not None else WALL_SEEN_MAX_M
+                roomR = R if R is not None else WALL_SEEN_MAX_M
+                side = "LEFT" if roomL >= roomR else "RIGHT"
+                need = 1.07 / 2 + 0.225 + 0.25
+                msg += (f"BOARD AHEAD {F:.2f} m → would stop + slide {side} (room L {roomL:.2f} / "
+                        f"R {roomR:.2f} m; needs ~{need + SIDE_TIP_M:.2f} m of side room past a centred board)")
+            elif L is not None and R is not None:
+                msg += f"clear ahead → centre between sides: move {(R - L) / 2:+.2f} m (+ = right)"
+            else:
+                msg += "clear ahead"
+            if (lc is not None and lc < SIDE_PUSH_M) or (rc is not None and rc < SIDE_PUSH_M):
+                msg += "  ⚠ PROP CLOSE TO A SIDE → would push away"
+            raw = li.last_raw
+            msg += "  | strength " + " ".join(f"{k[0].upper()}{raw[k][1] if raw[k] else '?'}" for k in raw)
+            log.info(msg)
+            time.sleep(0.4)
+    finally:
+        li.stop()
 
 
 def lidar_bench():
@@ -2053,15 +2116,26 @@ class Mission:
         dead = [k for k in ("front", "left", "right") if not self.lidar.alive(k)]
         return (not dead), ("all 3 answering" if not dead else f"NOT answering: {dead}")
 
-    def abort_climb(self, why):
-        log.error(f"\n!!! CORRIDOR ABORT: {why} — climbing straight up to {ABORT_ALT_M} m, then RTL")
+    def abort_climb(self, why, sensor=False):
+        """sensor=True: the LiDARs failed (nothing physical in the way). With
+        ON_ABORT='continue' the drone then does NOT climb: mission.py carries
+        on at corridor height by GPS. A physical block always climbs out."""
+        self.abort_reason = why
+        self.abort_sensor = sensor
+        if sensor and ON_ABORT == "continue":
+            log.error(f"\n!!! CORRIDOR: {why} — LiDAR problem, holding height, mission "
+                      "continues by GPS")
+            return False
+        log.error(f"\n!!! CORRIDOR ABORT: {why} — climbing straight up to {ABORT_ALT_M} m, then "
+                  + ("RTL" if ON_ABORT == "rtl" else "CONTINUING the mission"))
         p = self.here()
         t0 = time.time()
         while (self.d.alt() or 0) < ABORT_ALT_M - 0.3 and time.time() - t0 < 15:
             self.d.goto_ned(p[0], p[1], ABORT_ALT_M, self.yaw)
             self.tick(f"ABORT climb {self.d.alt() or 0:.1f} m")
-        self.releasing = True
-        self.d.set_mode("RTL")
+        if ON_ABORT == "rtl":
+            self.releasing = True
+            self.d.set_mode("RTL")
         return False
 
     def exit_climb(self, why):
@@ -2093,9 +2167,12 @@ class Mission:
         log.info(f"\n── CORRIDOR ({BANNER_COLOR}) heading {math.degrees(self.yaw) % 360:.1f}°, "
                  f"len {CORRIDOR_LEN_M} m, width {CORRIDOR_W_M} m — LiDARs: {msg} ──")
         if not ok:
-            log.error("  ✗ LiDARs not healthy — NOT entering the corridor → RTL")
-            self.releasing = True
-            self.d.set_mode("RTL")
+            self.abort_reason = f"LiDARs not healthy ({msg}) — corridor NOT entered"
+            log.error(f"  ✗ {self.abort_reason} → "
+                      + ("RTL" if ON_ABORT == "rtl" else "skipping it, mission continues"))
+            if ON_ABORT == "rtl":
+                self.releasing = True
+                self.d.set_mode("RTL")
             return False
         # back off at 5 m, then down to corridor height
         self.d.set_speed(ALIGN_SPEED_MS)
@@ -2114,6 +2191,8 @@ class Mission:
         n_walls = 0
         centre_lat = 0.0                    # corridor centre line (m right of the E0 line)
         hits, lane, t_lane, t_block = [], 0.0, 0.0, None   # obstacle planner
+        gst, g_side, g_hit, g_t0, g_line, g_ref, g_tried = "track", 0, 0.0, 0.0, 0.0, None, set()
+        self.gap_log = []
         t_sweep0 = time.time()
         n_obst = 0
         while True:
@@ -2137,7 +2216,7 @@ class Mission:
                 return True
             for k in ("front", "left", "right"):
                 if not self.lidar.alive(k):
-                    return self.abort_climb(f"{k} LiDAR stopped answering")
+                    return self.abort_climb(f"{k} LiDAR stopped answering", sensor=True)
             F, L, R = self.lidar.get("front"), self.lidar.get("left"), self.lidar.get("right")
             dyaw = 0.0
             if OBSTACLES:                      # actual nose offset from the corridor heading
@@ -2232,6 +2311,77 @@ class Mission:
                 if abs(lat - lane) > 0.2 or now - t_lane < SWEEP_PERIOD_S:
                     obst_hold = True
             lat_ref = lane if OBSTACLES else centre_lat
+            if OBST_MODE == "gap" and s_ > BACKOFF_M - 0.5:
+                to_end = (end_s if end_s is not None else BACKOFF_M + CORRIDOR_LEN_M) - s_
+                lc_ = Lw - SIDE_TIP_M if Lw is not None else None
+                rc_ = Rw - SIDE_TIP_M if Rw is not None else None
+                ahead = F is not None and F < GAP_DETECT_M and F < to_end - 0.3
+                if gst == "track":
+                    if err is not None:          # centre between whatever is beside us
+                        g_ref = (lat + err) if g_ref is None else 0.7 * g_ref + 0.3 * (lat + err)
+                    lat_ref = g_ref if g_ref is not None else centre_lat
+                    if err is not None and abs(err) > GAP_CENTRE_TOL_M:
+                        obst_hold = True             # not centred between the sides: centre FIRST
+                    if ahead:
+                        roomL = Lw if Lw is not None else WALL_SEEN_MAX_M
+                        roomR = Rw if Rw is not None else WALL_SEEN_MAX_M
+                        g_side = -1 if roomL >= roomR else 1
+                        gst, g_hit, g_t0, g_tried = "slide", s_ + F, now, {g_side}
+                        n_obst += 1
+                        log.info(f"  ▲ BOARD ahead at {F:.2f} m (s={s_ + F:.1f}) — stop, slide "
+                                 f"{'LEFT' if g_side < 0 else 'RIGHT'} (room L {roomL:.2f} / R {roomR:.2f} m)")
+                        self.gap_log.append(("board", round(s_ + F, 2), "L" if g_side < 0 else "R"))
+                if gst == "slide":
+                    obst_hold = True
+                    lat_ref = lat + g_side * 0.2           # creep sideways
+                    tight = (lc_ if g_side < 0 else rc_)
+                    side_rd = Lw if g_side < 0 else Rw
+                    if F is not None and F <= GAP_CLEAR_M:
+                        g_edge = lat                       # beam still on the board here
+                    if F is None or F > GAP_CLEAR_M:
+                        # the board edge is where the beam last hit it; the gap is
+                        # from that edge to the wall/board on this side -> fly its MIDDLE
+                        edge = locals().get("g_edge", lat)
+                        wall = (lat + g_side * (side_rd + 0.045)) if side_rd is not None \
+                            else centre_lat + g_side * CORRIDOR_W_M / 2
+                        gap_w = abs(wall - edge)
+                        need = 2 * 0.225 + 2 * GAP_MIN_CLEAR_M
+                        if gap_w >= need:
+                            g_line = (edge + wall) / 2
+                            gst = "settle"
+                            log.info(f"  ▲ beam clear: board edge {edge:+.2f}, side {wall:+.2f} → gap "
+                                     f"{gap_w:.2f} m, flying its middle {g_line:+.2f} m")
+                            self.gap_log.append(("gap", round(gap_w, 2), round(g_line, 2)))
+                        elif -g_side not in g_tried:
+                            log.info(f"  ▲ gap {gap_w:.2f} m too narrow (need {need:.2f}) — trying the other side")
+                            g_side = -g_side
+                            g_tried.add(g_side)
+                            g_t0 = now
+                        else:
+                            return self.abort_climb(f"no gap wide enough past the board "
+                                                    f"(last {gap_w:.2f} m, need {need:.2f})")
+                    elif (tight is not None and tight < GAP_SIDE_MIN_M) or now - g_t0 > GAP_TIMEOUT_S:
+                        if -g_side not in g_tried:
+                            g_side = -g_side
+                            g_tried.add(g_side)
+                            g_t0 = now
+                            log.info(f"  ▲ no room that way (clearance "
+                                     f"{tight if tight is not None else -1:.2f} m) — trying "
+                                     f"{'LEFT' if g_side < 0 else 'RIGHT'}")
+                        else:
+                            return self.abort_climb("board ahead and no gap wide enough on either side")
+                if gst == "settle":
+                    obst_hold = True
+                    lat_ref = g_line
+                    if abs(lat - g_line) < 0.12:
+                        gst = "pass"
+                if gst == "pass":
+                    lat_ref = g_line
+                    if s_ > g_hit + GAP_PASS_M:
+                        gst, g_ref = "track", None
+                        log.info(f"  ▲ passed the board (s={s_:.1f}) — re-centring")
+                    elif ahead and F < (g_hit - s_) - 0.4:          # a NEW board, nearer
+                        gst, g_hit, g_t0, g_tried = "slide", s_ + F, now, {g_side}
             # ── safety ──
             fc = F - FRONT_TIP_M if F is not None else None
             lc = Lw - SIDE_TIP_M if Lw is not None else None
@@ -2283,7 +2433,8 @@ class Mission:
                          f"L={fm(L)} R={fm(R)} F={fm(F)}  prop-clear L={fm(lc)} R={fm(rc)} F={fm(fc)}"
                          f"  alt {self.d.alt() or 0:.2f}{'  HOLD' if hold else ''}"
                          + (f"  lane {lane - centre_lat:+.2f} hits {len(hits)} yaw{math.degrees(dyaw):+.0f}°"
-                            if OBSTACLES else ""))
+                            if OBSTACLES else "")
+                         + (f"  gap:{gst}" if OBST_MODE == "gap" else ""))
             self.tick(f"CORRIDOR s={s_:.1f}")
 
     def after_corridor(self):
@@ -2531,6 +2682,9 @@ def bench(down, fwd, pv, alt=SEARCH_ALT_M):
             m = down.get_mask()
             if m is not None:
                 cv2.imwrite(os.path.join(DEBUG_DIR, "mask_down.jpg"), m)
+            fr = down.get()[0]
+            if fr is not None:          # the exact camera frame -> --test-image / send it
+                cv2.imwrite(os.path.join(DEBUG_DIR, "bench_down.jpg"), fr)
             t_mask = now
         time.sleep(0.05)
 
@@ -2595,6 +2749,9 @@ def main():
     if "--lidar-bench" in a:
         lidar_bench()
         return
+    if "--gap-bench" in a:
+        gap_bench()
+        return
     WHITE_BORDER = "--no-border" not in a
     set_banner_color("blue" if "--blue" in a else "green", loose=not WHITE_BORDER)
     log.info(f"Banner: {BANNER_COLOR}, " + ("VENUE banner (white border required, strict colour)"
@@ -2655,7 +2812,7 @@ def main():
     try:
         down, fwd = open_cameras(use_fwd)
         if bench_mode:
-            bench(down, fwd, pv)
+            bench(down, fwd, pv, alt=SEARCH_ALT_M)   # --alt = camera height above the banner
             return
         from pymavlink import mavutil as _m
         mavutil = _m

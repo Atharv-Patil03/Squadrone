@@ -55,11 +55,12 @@ mavutil = None
 # ═════════════════════════════════════════════════════════════════════════════
 
 # Field — keep A, B, C, D order:  A = start, A->B = first pass, D = finish
-# 40 x 30 m field, recorded with the drone on 21-10-2026
-POINT_A = (18.4897888, 73.8516870)   # start (SE)
-POINT_B = (18.4897842, 73.8512713)   # end of first pass (SW)
-POINT_C = (18.4900559, 73.8512742)   # NW
-POINT_D = (18.4900635, 73.8516404)   # finish (NE)
+# COMPETITION VENUE (Bangalore), waypoint map 30-10-2026: field ~16 x 23 m.
+# (old Pune practice field: A 18.4897888, 73.8516870 ...)
+POINT_A = (13.1705094, 77.5330114)   # start
+POINT_B = (13.1705518, 77.5328726)   # end of first pass
+POINT_C = (13.1707492, 77.5329336)
+POINT_D = (13.1707059, 77.5330857)   # finish
 VERTICES = [POINT_A, POINT_B, POINT_C, POINT_D]
 # Corners recorded BY THE DRONE (python survey.py --record A ... D) are saved
 # here and override the values above. Delete the file to go back to them.
@@ -68,7 +69,7 @@ INSET_M = 2.0
 
 SURVEY_ALT_M    = 10.0
 SPACING_M       = 8.0
-SPEED_MPS       = 1.5
+SPEED_MPS       = 1.0
 ACCEPT_RADIUS_M = 1.0
 WAYPOINT_TIMEOUT = 120
 GEOFENCE_MARGIN_M = 3.0    # further than this outside the field -> RTL
@@ -121,9 +122,9 @@ LATCH_OPEN_PWM   = 1000
 LATCH_WAIT_S     = 2.0
 WINCH_SERVO      = 5
 WINCH_STOP_PWM   = 1500
-WINCH_UNWIND_PWM = 1000      # lowers the payload
-WINCH_REWIND_PWM = 2000      # pulls it back up
-UNWIND_S         = 40.0
+WINCH_UNWIND_PWM = 2000      # lowers the payload
+WINCH_REWIND_PWM = 1000      # pulls it back up
+UNWIND_S         = 50.0
 REWIND_BEFORE_RTL = False    # --rewind: wind the line back up before RTL
 
 # GO_ON_MATCH: the moment a QR is a CONFIDENT match (same text, or image score
@@ -132,6 +133,8 @@ REWIND_BEFORE_RTL = False    # --rewind: wind the line back up before RTL
 # and resume the survey where it left off. --full-survey = old behaviour
 # (finish the whole lawnmower first, then go to the best match).
 GO_ON_MATCH = True
+AUTO_DROP = False           # True = no operator prompt: drop by itself when SURE
+                            # (same AprilTag ID, or close-up image >= CONFIDENT_IMAGE)
 CONFIDENT_IMAGE = 0.85      # image score (median of 2+ looks) to interrupt the survey.
                             # Between IMAGE_MATCH_THRESHOLD and this = "possible match":
                             # the survey finishes, then the best-scoring QR is visited
@@ -1705,13 +1708,13 @@ class Survey:
         return q.aligned
 
     # ── start QR ─────────────────────────────────────────────────────────
-    def capture_reference(self, home):
+    def capture_reference(self, home, fallback=True, timeout=None):
         """Hover at REF_ALT_M over the takeoff spot and store the start QR."""
         self.phase("read start QR (5 m)")
         log.info(f"\n══ READING START QR at {REF_ALT_M:.0f} m ══")
         seen = []
         t0 = time.time()
-        while time.time() - t0 < REF_TIMEOUT_S and len(seen) < REF_SIGHTINGS + 2:
+        while time.time() - t0 < (timeout or REF_TIMEOUT_S) and len(seen) < REF_SIGHTINGS + 2:
             self.d.check()
             self.d.goto_xy(home[0], home[1], REF_ALT_M, self.yaw)
             for o in self.cam.drain():
@@ -1728,6 +1731,9 @@ class Survey:
                 seen.append((q["text"], q["crop"], sharp, (p[1] + e, p[2] + n)))
             time.sleep(0.1)
         if len(seen) < REF_SIGHTINGS:
+            if not fallback:
+                log.warning(f"  ✗ start tag not seen here ({len(seen)} sightings)")
+                return False
             log.warning(f"  ✗ Start QR not seen ({len(seen)} sightings) — trying the "
                         "saved reference")
             if self.ref.load():
@@ -1906,8 +1912,8 @@ class Survey:
             self.match_report(highlight=q.id)
             q.tried = True
             more = i + 1 < len(cands)
-            self.phase(f"operator confirm #{q.id}")
-            while True:
+            self.phase(f"operator confirm #{q.id}" if not AUTO_DROP else f"auto decision #{q.id}")
+            while not AUTO_DROP:
                 ans = self.ask_holding(
                     (q.x, q.y), DELIVERY_ALT_M,
                     f"\n>>> Over QR #{q.id} at {self.d.alt() or 0:.1f} m "
@@ -1923,8 +1929,17 @@ class Survey:
                 if ans in ("yes", "no"):
                     break
                 print("  type yes or no")
+            if AUTO_DROP:
+                # NO operator: drop only when SURE — same AprilTag ID as the start
+                # tag, or (no ID read) a confident image match in the close-up
+                low_med = float(np.median(low)) if low else None
+                sure = bool(q.text_match) or (low_med is not None and low_med >= CONFIDENT_IMAGE)
+                why = ("same ID as the start tag" if q.text_match else
+                       f"close-up image score {close} (need {CONFIDENT_IMAGE})")
+                log.info(f"  AUTO (no operator): QR #{q.id} {'SURE' if sure else 'NOT sure'} — {why}")
+                ans = "yes" if sure else "no"
             if ans == "yes":
-                log.info(f"  ✓ Operator CONFIRMED QR #{q.id} as the match")
+                log.info(f"  ✓ {'AUTO-' if AUTO_DROP else 'Operator '}CONFIRMED QR #{q.id} as the match")
                 self.confirmed = q
                 if PAYLOAD:
                     self.drop_payload(q)
@@ -2099,6 +2114,11 @@ def load_corners():
         return
     with open(CORNERS_FILE) as f:
         c = json.load(f)
+    if "A" in c and math.dist((0, 0), latlon_to_xy(*c["A"], *POINT_A)) > 500:
+        log.warning(f"  ⚠ {CORNERS_FILE} holds corners of ANOTHER site (A is "
+                    f"{math.dist((0, 0), latlon_to_xy(*c['A'], *POINT_A)) / 1000:.0f} km away) — "
+                    "IGNORED, using the built-in venue corners. Delete that file.")
+        return
     missing = [k for k in "ABCD" if k not in c]
     if missing:
         raise SystemExit(f"field_corners.json is missing {', '.join(missing)} — record "
@@ -2395,7 +2415,7 @@ def main():
     ap.add_argument("--conn", default=SERIAL_PORT)
     ap.add_argument("--baud", type=int, default=BAUD_RATE)
     ap.add_argument("--plan-only", action="store_true")
-    ap.add_argument("--record", choices=list("ABCD"),
+    ap.add_argument("--record", choices=list("ABCD") + ["GREEN_IN", "GREEN_OUT", "BLUE_IN", "BLUE_OUT"],
                     help="stand the drone on that corner and save its GPS position")
     ap.add_argument("--bench", action="store_true")
     ap.add_argument("--markers", choices=["apriltag", "qr"], default=MARKERS,

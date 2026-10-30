@@ -6,7 +6,21 @@ Team: Squadrone AT2026RC60, PVGCOET Pune, SAEINDIA AeroTHON 2026
 Glues the two field-tested scripts together — they must be in the SAME folder
 with exactly these names:   survey.py   corridor.py   mission.py
 
-PHASES
+DEFAULT FLOW (30-10, GPS corridor points — see CORRIDOR_POINTS below)
+  takeoff -> start tag at 5 m -> fly to GREEN_IN at 5 m facing GREEN_OUT -> banner
+  camera LOOKS (shown + logged, does not steer) -> back off, descend, LiDAR corridor
+  -> 10 m -> lawnmower -> AUTO drop when SURE (same AprilTag ID) -> rewind line
+  -> BLUE_IN (attempt: stops + climbs out at an obstacle) or --blue skip -> RTL.
+  Any corridor trouble (LiDAR dead/unsure, wall too close, blocked) = climb
+  straight up and CONTINUE with the next phase, no hovering, no RTL.
+  Record the points with the drone standing on each spot:
+     python3 survey.py --record GREEN_IN   (GREEN_OUT, BLUE_IN, BLUE_OUT)
+  python3 mission.py                         # this flow
+  python3 mission.py --blue skip             # RTL after the payload
+  python3 mission.py --ask                   # operator types yes/no before the drop
+  python3 mission.py --vision-search         # OLD flow below (banner search, no GPS points)
+
+OLD FLOW (--vision-search)
   1. PREFLIGHT  LiDARs, camera, GPS, servos (latch closed, winch stop), RTL_ALT.
   2. TAKEOFF    to 5 m over the take-off spot (nose roughly towards the corridor).
   3. START QR   read + store the start QR at 5 m          (survey.py, high-res cam)
@@ -53,6 +67,57 @@ for h in logging.getLogger().handlers:
 
 class Abort(Exception):
     pass
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CORRIDOR POINTS (GPS)  — the drone flies to these instead of searching.
+#   GREEN_IN  = centre of the green GROUND banner (corridor mouth)
+#   GREEN_OUT = centre of the far (exit) end of the green corridor, between the walls
+#   BLUE_IN / BLUE_OUT = same for the blue corridor (fly IN -> OUT)
+# Either type them here (lat, lon) or record them with the drone standing on the
+# spot:  python3 survey.py --record GREEN_IN   (saved in ~/squadrone/field_corners.json,
+# which wins over the values below).
+# ═════════════════════════════════════════════════════════════════════════════
+# Venue waypoint map 30-10 (A..D field, corridors outside the A-D edge):
+#   green walls N-M / P-K, entry L (ground banner), exit O;
+#   blue  walls G-H / E-I, entry F (ground banner), exit J/J2.
+VENUE = {
+    "A": (13.1705094, 77.5330114), "B": (13.1705518, 77.5328726),
+    "C": (13.1707492, 77.5329336), "D": (13.1707059, 77.5330857),
+    "E": (13.1706642, 77.5330787), "F": (13.1706544, 77.5330581),
+    "G": (13.1706389, 77.5330605), "H": (13.1706007, 77.5331004),
+    "I": (13.1706414, 77.5331319), "J": (13.1706311, 77.5331340),
+    "J2": (13.1706273, 77.5331254), "K": (13.1705882, 77.5331196),
+    "L": (13.1705764, 77.5331010), "M": (13.1705573, 77.5330965),
+    "N": (13.1705864, 77.5330484), "O": (13.1705964, 77.5330516),
+    "P": (13.1706151, 77.5330615), "QR": (13.1705856, 77.5331492),
+    "Takeoff": (13.1705787, 77.5331730),
+}
+# Each corridor centre = average of the measured centre point and the midpoint
+# of the two wall ends (GPS noise ~1 m per point; L is 0.9 m and O 0.6 m from
+# their wall midpoints). Green: 6.2 m long, heading 296°. Blue: 7.0 m, 117°.
+CORRIDOR_POINTS = {
+    "GREEN_IN":  (13.1705746, 77.5331045),   # ~ L
+    "GREEN_OUT": (13.1705986, 77.5330533),   # ~ O
+    "BLUE_IN":   (13.1706530, 77.5330639),   # ~ F
+    "BLUE_OUT":  (13.1706242, 77.5331208),   # ~ J2 / mid(H, I)
+    "START_QR":  (13.1705856, 77.5331492),   # QR (start tag), read at 5 m
+}
+VISION_LOOK_S = 4.0         # at the entry point: look for the banner this long (logged/shown)
+POINT_TOL_M   = 0.5         # "arrived" at a GPS point
+OVER_ALT_M    = 6.0         # fly OVER a corridor at this (walls 2.44 m, poles ~4 m)
+QR_RETRY_M    = 1.5         # start tag not seen at QR: move this far forward, read again
+
+
+def load_points():
+    pts = dict(CORRIDOR_POINTS)
+    if os.path.isfile(S.CORNERS_FILE):
+        import json
+        with open(S.CORNERS_FILE) as f:
+            for k, v in json.load(f).items():
+                if k in pts and math.dist((0, 0), S.latlon_to_xy(*v, *VENUE["A"])) < 500:
+                    pts[k] = tuple(v)          # drone-recorded point of THIS venue wins
+    return pts
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -110,6 +175,8 @@ class MissionRun:
         self.t_phase = None
         self.drone = self.scam = self.lidar = self.down = self.pv = None
         self.sv = None
+        self.lidar_bad = False
+        self.pts = load_points()
 
     # ── bookkeeping ──────────────────────────────────────────────────────
     def begin(self, name):
@@ -168,7 +235,12 @@ class MissionRun:
                 f"{k}={'%.2fm' % v if v is not None else '--'}{'' if alive[k] else ' (NOT ANSWERING)'}"
                 for k, v in vals.items()))
             if not all(alive.values()):
-                self.end(False, "a LiDAR is not answering")
+                if self.a.gps_corridor:
+                    log.warning("  ⚠ a LiDAR is not answering — the GREEN corridor will be SKIPPED, "
+                                "mission goes straight to the lawnmower")
+                    self.lidar_bad = True
+                else:
+                    self.end(False, "a LiDAR is not answering")
         self.drone = S.Drone(self.a.conn, self.a.baud, self.origin)
         self.drone.wait_gps()
         self.start_yaw = CorridorDrone(self.drone).yaw() or 0.0
@@ -198,7 +270,20 @@ class MissionRun:
         self.begin("START QR")
         self.sv = S.Survey(self.drone, self.survey_cam_on(), self.field, self.path, self.origin)
         self.sv.yaw = self.start_yaw                      # don't spin while reading
-        ok = self.sv.capture_reference(self.home)
+        qr_ll = self.pts.get("START_QR") if self.a.gps_corridor else None
+        spot = S.latlon_to_xy(*qr_ll, *self.origin) if qr_ll else self.home
+        if qr_ll:
+            log.info(f"  start tag at point QR, {math.dist(self.home, spot):.1f} m from take-off")
+            ok = self.sv.capture_reference(spot, fallback=False, timeout=12)
+            if not ok:
+                # not seen: 1.5 m further in the take-off -> QR direction, look again
+                d = math.dist(self.home, spot) or 1.0
+                spot2 = (spot[0] + (spot[0] - self.home[0]) / d * QR_RETRY_M,
+                         spot[1] + (spot[1] - self.home[1]) / d * QR_RETRY_M)
+                log.info(f"  → moving {QR_RETRY_M} m forward and reading again")
+                ok = self.sv.capture_reference(spot2)        # this one may use the saved tag
+        else:
+            ok = self.sv.capture_reference(spot)
         self.end(ok, self.sv.ref.describe() if ok else "start QR not seen")
 
     def corridor(self):
@@ -235,6 +320,174 @@ class MissionRun:
             raise Abort("corridor aborted (drone already climbing / RTL)")
         self.end(False, "could not centre on the banner")
 
+    # ── GPS-guided corridor (green or blue) ─────────────────────────────
+    def fly_to(self, x, y, alt, yaw, label, timeout=90):
+        """Field-frame point (x east, y north); climbs/descends on the way."""
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            self.drone.check()
+            p = self.drone.xy()
+            if p and math.dist(p, (x, y)) < POINT_TOL_M and abs((self.drone.alt() or 0) - alt) < 0.4:
+                return True
+            self.drone.goto_xy(x, y, alt, yaw)
+            if int(time.time() * 2) % 4 == 0:
+                log.info(f"  [{label}] {math.dist(p, (x, y)) if p else -1:.1f} m to go, "
+                         f"alt {self.drone.alt() or 0:.1f} m")
+            time.sleep(0.25)
+        log.warning(f"  [{label}] not reached in {timeout} s")
+        return False
+
+    def gps_corridor(self, color):
+        """Fly to <COLOR>_IN at 5 m facing <COLOR>_OUT, LOOK for the banner (logged
+        + shown, not used to move), then back off / descend / LiDAR corridor.
+        Returns True through, False skipped/aborted (the drone is then at
+        ABORT_ALT_M or higher, mission continues)."""
+        a_ll, b_ll = self.pts.get(f"{color.upper()}_IN"), self.pts.get(f"{color.upper()}_OUT")
+        if not a_ll or not b_ll:
+            log.warning(f"  {color.upper()}_IN / _OUT not set — {color} corridor SKIPPED")
+            return False
+        ax, ay = S.latlon_to_xy(*a_ll, *self.origin)
+        bx, by = S.latlon_to_xy(*b_ll, *self.origin)
+        yaw = S.bearing((ax, ay), (bx, by))
+        length = math.dist((ax, ay), (bx, by))
+        self.corr_yaw = yaw
+        C.set_banner_color(color, loose=self.a.no_border)
+        C.OBST_MODE = "gap" if (color == "blue" and self.a.blue == "gap") else None
+        if C.OBST_MODE:
+            log.warning("  ⚠ BLUE: GAP obstacle navigation ON (experimental — sim: some runs "
+                        "came within a few cm of a board)")
+        if self.a.corridor_len is None:
+            C.CORRIDOR_LEN_M = length
+        log.info(f"  {color.upper()} corridor from GPS: entry ({ax:.1f}, {ay:.1f}) -> exit "
+                 f"({bx:.1f}, {by:.1f}), heading {math.degrees(yaw) % 360:.0f}°, length "
+                 f"{length:.1f} m (using {C.CORRIDOR_LEN_M:.1f} m)")
+        if length < 2 or length > 20:
+            log.error(f"  ✗ {color} entry/exit {length:.1f} m apart — points look wrong, SKIPPED")
+            return False
+        # 1) to the entry point at search height, nose along the corridor
+        here = self.drone.xy()
+        self.drone.cmd(S.mavutil.mavlink.MAV_CMD_DO_CHANGE_SPEED, 1, C.SEARCH_SPEED_MS, -1)
+        if (self.drone.alt() or 0) < C.SEARCH_ALT_M - 0.5:
+            self.fly_to(here[0], here[1], C.SEARCH_ALT_M, yaw, "climb", 30)
+        if not self.fly_to(ax, ay, C.SEARCH_ALT_M, yaw, f"to {color.upper()}_IN", 120):
+            return False
+        # 2) banner camera ON: look + log (vision does NOT move the drone)
+        down = self.banner_cam_on()
+        self.pv = self.pv or C.Preview()
+        cd = CorridorDrone(self.drone)
+        m = C.Mission(cd, down, None, self.pv)
+        m.lidar = self.lidar
+        m.yaw = yaw
+        self.vision_check(m, color, yaw)
+        # 3) corridor: back off, descend, LiDARs (unchanged code)
+        if self.lidar is None or self.lidar_bad:
+            log.warning("  no healthy LiDARs — corridor not entered")
+            return False
+        self.last_m = m
+        ok = m.corridor()
+        self.corr_log_n = len(m.corr_log)
+        if not ok:
+            log.warning(f"  {color} corridor: {getattr(m, 'abort_reason', 'aborted')}")
+        return ok
+
+    def vision_check(self, m, color, yaw):
+        t0, looks = time.time(), []
+        while time.time() - t0 < VISION_LOOK_S:
+            p = self.drone.xy()
+            self.drone.goto_xy(p[0], p[1], C.SEARCH_ALT_M, yaw)
+            det = m.down_conf()
+            if det is not None and det.get("t", 0) and (not looks or det["t"] != looks[-1][2]):
+                f, r = C.down_pixel_to_body(det["center"][0], det["center"][1],
+                                            self.drone.alt() or C.SEARCH_ALT_M)
+                ang = None
+                if det.get("axis") and det.get("elong", 0) >= 3:
+                    ax_, ay_ = det["axis"]
+                    cx, cy = det["center"]
+                    alt = self.drone.alt() or C.SEARCH_ALT_M
+                    f1, r1 = C.down_pixel_to_body(cx - 60 * ax_, cy - 60 * ay_, alt)
+                    f2, r2 = C.down_pixel_to_body(cx + 60 * ax_, cy + 60 * ay_, alt)
+                    ang = (math.degrees(math.atan2(r2 - r1, f2 - f1) + math.pi / 2) + 90) % 180 - 90
+                looks.append((f, r, det["t"], ang))
+            self.pv.update(m.down, None, f"VISION CHECK {color}: {len(looks)} looks")
+            time.sleep(0.1)
+        if looks:
+            f = float(np.median([l[0] for l in looks]))
+            r = float(np.median([l[1] for l in looks]))
+            angs = [l[3] for l in looks if l[3] is not None]
+            log.info(f"  ★ VISION: {color} banner SEEN ({len(looks)} looks) — it is {f:+.2f} m fwd, "
+                     f"{r:+.2f} m right of the GPS entry point"
+                     + (f"; corridor {np.median(angs):+.0f}° from the GPS heading" if angs else "")
+                     + "  (shown/logged only — GPS + LiDARs steer)")
+        else:
+            log.info(f"  VISION: {color} banner NOT seen in {VISION_LOOK_S:.0f} s at the GPS entry "
+                     "point (GPS + LiDARs steer anyway)")
+
+    def green_gps(self):
+        self.begin("GREEN CORRIDOR (GPS)")
+        if self.sv is not None:
+            self.sv.phase("green corridor (mission)")
+        if self.lidar_bad:
+            self.results.append((self.cur, False, 0.0, "LiDAR not answering — skipped"))
+            log.warning("  skipped: LiDAR not answering → lawnmower")
+            return
+        ok = self.gps_corridor("green")
+        if not ok and self.pts.get("GREEN_OUT"):
+            # couldn't get through with the LiDARs -> go to O at the height it is at
+            # now, then 10 m. Exception: something PHYSICAL blocked it (wall too
+            # close / board ahead) -> it already climbed out; cross ABOVE the walls.
+            ox, oy = S.latlon_to_xy(*self.pts["GREEN_OUT"], *self.origin)
+            m = getattr(self, "last_m", None)
+            sensor = bool(m is not None and getattr(m, "abort_sensor", False))
+            alt_now = self.drone.alt() or C.CORRIDOR_ALT_M
+            alt = alt_now if (sensor or alt_now >= OVER_ALT_M - 1.5) else OVER_ALT_M
+            log.warning(f"  → fallback: flying to O (green exit) at {alt:.1f} m "
+                        + ("(LiDAR problem: same height, by GPS)" if sensor else
+                           "(blocked: above the walls)" if alt != alt_now else "(same height)"))
+            p = self.drone.xy()
+            if abs(alt - alt_now) > 0.3:
+                self.fly_to(p[0], p[1], alt, self.corr_yaw, "height", 30)
+            self.drone.cmd(S.mavutil.mavlink.MAV_CMD_DO_CHANGE_SPEED, 1,
+                           C.CORRIDOR_SPEED if sensor else C.ALIGN_SPEED_MS, -1)
+            self.fly_to(ox, oy, alt, self.corr_yaw, "to O", 90)
+        dt = time.time() - self.t_phase
+        self.results.append((self.cur, ok, dt, "through" if ok else "skipped/aborted → lawnmower"))
+        log.info(f"█  {self.cur}: {'✓ THROUGH' if ok else '✗ not through — continuing to the lawnmower'} "
+                 f"in {dt:.0f} s")
+
+    def blue(self):
+        self.begin("BLUE CORRIDOR")
+        if self.a.blue == "skip":
+            self.results.append((self.cur, True, 0.0, "skipped (--blue skip)"))
+            log.info("  skipped (--blue skip) → RTL")
+            return
+        if S.PAYLOAD and self.sv is not None and self.sv.payload_done and not S.REWIND_BEFORE_RTL:
+            log.warning("  ⚠ payload line was NOT rewound — not flying a low corridor with it "
+                        "hanging. Blue skipped.")
+            self.results.append((self.cur, False, 0.0, "line not rewound — skipped"))
+            return
+        if self.scam is not None:
+            self.drone.cmd(S.mavutil.mavlink.MAV_CMD_DO_CHANGE_SPEED, 1, S.SPEED_MPS, -1)
+        bi = self.pts.get("BLUE_IN")
+        if bi:                                         # transit at survey height first
+            bx, by = S.latlon_to_xy(*bi, *self.origin)
+            p = self.drone.xy()
+            yaw = S.bearing(p, (bx, by)) if math.dist(p, (bx, by)) > 1 else self.start_yaw
+            self.fly_to(p[0], p[1], max(self.drone.alt() or 0, S.SURVEY_ALT_M), yaw, "up", 30)
+            self.fly_to(bx, by, S.SURVEY_ALT_M, yaw, "to BLUE_IN at 10 m", 150)
+        ok = self.gps_corridor("blue")
+        dt = time.time() - self.t_phase
+        self.results.append((self.cur, ok, dt, "through" if ok else "attempted — stopped (obstacle/LiDAR)"))
+        log.info(f"█  {self.cur}: {'✓ THROUGH' if ok else '✗ attempted, not through'} in {dt:.0f} s → RTL")
+
+    def climb_soft(self):
+        """Up to survey height, never aborts the mission."""
+        p = self.drone.xy()
+        t0 = time.time()
+        while (self.drone.alt() or 0) < S.SURVEY_ALT_M - 0.5 and time.time() - t0 < 25:
+            self.drone.check()
+            self.drone.goto_xy(p[0], p[1], S.SURVEY_ALT_M, getattr(self, "corr_yaw", self.start_yaw))
+            time.sleep(0.2)
+
     def climb(self):
         self.begin("CLIMB")
         p = self.drone.xy()
@@ -260,6 +513,15 @@ class MissionRun:
         sv.wait_alt(xy[0], xy[1], S.SURVEY_ALT_M)
         sv.run(S.TARGET_QR)
         q = sv.confirmed
+        p = self.drone.xy()
+        if (self.drone.alt() or 0) < S.SURVEY_ALT_M - 0.5:
+            log.info("  back up to 10 m after the payload")
+            self.fly_to(p[0], p[1], S.SURVEY_ALT_M, sv.yaw, "up to 10 m", 30)
+        if self.a.gps_corridor:
+            self.results.append((self.cur, True, time.time() - self.t_phase,
+                                 (f"payload delivered over QR #{q.id}" if sv.payload_done else
+                                  f"QR #{q.id}, no payload") if q else "no QR matched"))
+            return
         self.end(True, (f"payload delivered over QR #{q.id}" if sv.payload_done else
                         f"confirmed QR #{q.id}, no payload") if q else "no QR confirmed")
 
@@ -270,11 +532,19 @@ class MissionRun:
             self.preflight()
             self.takeoff()
             self.start_qr()
-            if not self.a.skip_corridor:
-                self.corridor()
-                self.climb()
-            if not self.a.skip_survey:
-                self.survey()
+            if self.a.gps_corridor:
+                if not self.a.skip_corridor:
+                    self.green_gps()
+                    self.climb_soft()
+                if not self.a.skip_survey:
+                    self.survey()
+                self.blue()
+            else:
+                if not self.a.skip_corridor:
+                    self.corridor()
+                    self.climb()
+                if not self.a.skip_survey:
+                    self.survey()
             log.info("\n✓ MISSION COMPLETE → RTL")
         except (S.PilotTookOver, C.PilotTookOver):
             took_over = True
@@ -331,6 +601,15 @@ def main():
                     help="practice strip without the white border (wide colour gate)")
     ap.add_argument("--markers", choices=["apriltag", "qr"], default="apriltag",
                     help="apriltag = AprilTag 36h11 IDs (competition), qr = old QR pipeline")
+    ap.add_argument("--vision-search", dest="gps_corridor", action="store_false",
+                    help="old flow: SEARCH for the green banner (no GPS corridor points)")
+    ap.add_argument("--survey-only", action="store_true",
+                    help="skip BOTH corridors: start tag, lawnmower, payload, 10 m, RTL")
+    ap.add_argument("--blue", choices=["attempt", "gap", "skip"], default="attempt",
+                    help="after the payload: attempt = fly in, stop at the board, climb out, RTL "
+                         "(option 1); gap = EXPERIMENTAL board avoidance (option 2); skip -> RTL")
+    ap.add_argument("--ask", action="store_true",
+                    help="operator confirms the drop (old behaviour); default: AUTO when sure")
     ap.add_argument("--tries", type=int)
     ap.add_argument("--step", type=float)
     ap.add_argument("--side", type=float)
@@ -357,6 +636,13 @@ def main():
     C.WHITE_BORDER = not a.no_border
     C.set_banner_color("green", loose=a.no_border)
     C.OBSTACLES = False
+    if a.survey_only:
+        a.skip_corridor, a.blue = True, "skip"
+    if a.gps_corridor:
+        C.ON_ABORT = "continue"            # corridor trouble -> climb out, mission goes on
+        S.AUTO_DROP = not a.ask
+        if a.blue in ("attempt", "gap") and S.PAYLOAD:
+            S.REWIND_BEFORE_RTL = True     # wind the line up before flying the blue corridor
     if a.cam == "imx500":
         C.DOWN_MODEL = "imx500"
         C.FULL_HFOV_DEG = C.DOWN_HFOV_DEG = 67.1
@@ -377,7 +663,21 @@ def main():
     log.info(f"  banner search {C.MAX_TRIES} tries x {C.SEARCH_STEP_FWD_M} m, ±{C.SEARCH_SIDE_M} m | "
              f"corridor {C.CORRIDOR_LEN_M} x {C.CORRIDOR_W_M} m at {C.CORRIDOR_ALT_M} m, "
              f"{C.CORRIDOR_SPEED} m/s | survey {S.SURVEY_ALT_M} m, delivery {S.DELIVERY_ALT_M} m")
+    if a.gps_corridor:
+        pts = load_points()
+        log.info("  FLOW: start tag → GREEN corridor by GPS (vision shown/logged) + LiDARs → "
+                 "lawnmower → " + ("AUTO drop when sure" if S.AUTO_DROP else "operator confirms drop")
+                 + f" → BLUE {a.blue} → RTL.  Corridor trouble = climb out + continue.")
+        for k, v in pts.items():
+            log.info(f"    {k:9s} {v if v else 'NOT SET'}")
     log.info("=" * 64)
+    if a.blue == "gap":
+        ans = input("\n>>> --blue gap = EXPERIMENTAL obstacle avoidance (single front beam; "
+                    "in simulation some runs came within a few cm of a board).\n"
+                    "    Type GAP to use it, anything else = option 1 (stop at the board): ").strip()
+        if ans != "GAP":
+            a.blue = "attempt"
+            log.info("  → blue = option 1 (attempt, stop at the board)")
     MissionRun(a).run()
 
 
